@@ -96,7 +96,21 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: main @ c08b4e2b70 alone builds the chunk at
+  // 13,171,024 B (12862.3 KB) against the 12870 KB ceiling -- 7.7 KB left, or
+  // 0.06% headroom, the same drift a fourth time. The memory-consolidation
+  // refusal branch adds the Memory tab's copy (skip fragments naming the mode,
+  // the failed-session list with its per-source labels, the list-failure
+  // "Try again", the refusal notices) across the 13 catalogs plus the generated
+  // `en-XA` pseudo-locale, and the chunk builds at 13,185,765 B (12876.7 KB) --
+  // 6.7 KB over. Attribution is measured, not assumed: reverting ONLY the files
+  // under `website/src/i18n/` to main and rebuilding this branch's tree gives
+  // the 13,171,024 B above, byte for byte and with the same content hash, so
+  // the whole 14,741 B (14.4 KB) delta is catalog copy; the report still counts
+  // 14 modules (13 catalogs plus the entry) and no library reached the chunk,
+  // so no lazy `import()` boundary or codeSplitting group can take it back out.
+  // Back to the 5% convention over the measurement that includes this branch.
+  all: 13520 * KB, // measured 12876.7 KB on this branch @ main c08b4e2b70 2026-09-24 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
