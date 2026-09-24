@@ -96,7 +96,13 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: main's tip had grown to within a few bytes of the
+  // 12870 KB ceiling, so the welcome-screen greetings (8 keys across 13
+  // catalogs plus `en-XA`, ~8.9 KB of source) put the chunk 9.2 KB over it at
+  // 13,188,256 B (12879.2 KB). Same cause as every note above: catalog strings,
+  // no module, nothing a lazy import() boundary can move. Back to the 5%
+  // convention over that measurement.
+  all: 13525 * KB, // measured 12879.2 KB on 927057468 + welcome greetings 2026-09-24 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
