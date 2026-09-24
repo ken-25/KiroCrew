@@ -309,10 +309,14 @@ PAGE_SIZE = 100
 # The repo-wide run listing (`GET /repos/{repo}/actions/runs?status=…`) returns
 # runs of EVERY workflow, so one paginated call per status covers the watched set
 # instead of one call per watched workflow. An orphan is an OLD run and rides at
-# the tail of the newest-first listing, so paging must reach it -- this cap is set
-# well above the repo's observed peak (~172 concurrent runs, so ~2 full pages) to
-# do that while still bounding a runaway that would otherwise page forever.
-REPO_LISTING_MAX_PAGES = 8
+# the tail of the newest-first listing, so paging must reach it while still
+# bounding a runaway that would otherwise page forever. Measured on this
+# repository: `status=queued` alone reports `total_count` 927 over ten pages, and
+# a six-hour-old `fast-gate.yml` orphan holding `main`'s concurrency slot sits on
+# page SEVEN. A premise of ~172 concurrent runs (about two pages) does not
+# describe this load, so the cap is set past the whole measured set rather than
+# just past that orphan.
+REPO_LISTING_MAX_PAGES = 12
 # Cancelled runs are indexed newest-first by CREATION time, but recovery selects
 # by cancellation update time, so a long-running orphan sits deep in this index
 # even when its cancellation is inside the recovery window. Sixteen pages hold
@@ -1179,11 +1183,15 @@ def _iter_repo_runs(
 
     ``GET /repos/{repo}/actions/runs?status=…`` is repo-wide: one paginated call
     returns runs of every workflow, so a single call chain per status covers the
-    watched set. The caller filters to the watched set from each run's ``path``. Paging stops at
-    the first short or empty page, or at ``max_pages`` -- the page cap that bounds a
-    runaway; because an orphan is an old run at the tail of the newest-first
-    listing, that cap is set high enough (see ``REPO_LISTING_MAX_PAGES``) to reach
-    it under the repo's real load.
+    watched set. The caller filters to the watched set from each run's ``path``.
+
+    Paging stops at the first EMPTY page, or at ``max_pages`` -- the page cap that
+    bounds a runaway. A SHORT page does not end this listing: measured against
+    `status=queued` on this repository, the endpoint returns 98, then 100, then
+    100, then 99 while `total_count` stands at 927, so a page below ``PAGE_SIZE``
+    is a property of the index rather than the tail. Treating one as the end stops
+    a tick after page one, which collapses the reach to the newest ~2 minutes of
+    runs while the orphan threshold is 15 minutes, and hides a six-hour outage.
     """
     fetch = get or api.get
     page = 1
@@ -1197,8 +1205,6 @@ def _iter_repo_runs(
         if not batch:
             return
         yield from batch
-        if len(batch) < PAGE_SIZE:
-            return
         if page == max_pages:
             log(
                 f"::warning::{status} run listing truncated after {max_pages} full "
@@ -1225,7 +1231,14 @@ def list_runs(api: Api, repo: str, workflow: str, *, status: str, cap: int) -> l
     below every short run created since it started. Scoped to one workflow, whose
     runs share a duration, creation order tracks completion order and the newest
     page holds the newest finishes. The total stays capped at ``COMPLETED_SAMPLE``
-    either way."""
+    either way.
+
+    A SHORT page is not the tail here either: this is the same status-filtered runs
+    index as the repo-wide listing, only scoped to one workflow, and that index
+    returns pages below ``per_page`` mid-listing. So paging stops on the cap or an
+    EMPTY page, never on a short one. In practice a watched workflow's first page
+    already exceeds ``cap``, so the empty-page read costs nothing for the
+    workflows this samples."""
     runs: list[dict[str, Any]] = []
     page = 1
     while len(runs) < cap:
@@ -1238,8 +1251,6 @@ def list_runs(api: Api, repo: str, workflow: str, *, status: str, cap: int) -> l
         if not batch:
             break
         runs.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break
         page += 1
     del runs[cap:]
     return sorted(runs, key=lambda run: run["created_at"])
@@ -1256,13 +1267,15 @@ def gather_all_candidate_runs(
 
     One paginated repo-wide listing per candidate status covers every workflow at
     once, and each run is kept only if its ``path`` names a watched workflow. This
-    is one listing per status instead of one per watched workflow, and it covers
-    strictly more: a fleet-routed workflow nobody registered is still returned (and
-    dropped only because it is not in the watched set). No newest-N truncation is
-    applied here -- an orphan is an OLD run at the tail of the newest-first
-    listing, so keeping only the newest N would discard exactly the runs being
-    hunted; the page cap bounds the listing cost, and the global per-tick heal cap
-    still bounds how many runs are acted on.
+    is one listing per status instead of one per watched workflow, and it reaches a
+    fleet-routed workflow nobody registered (returned, then dropped for not being
+    in the watched set) -- breadth a per-workflow chain cannot have. It is NOT
+    strictly more: breadth and depth are separate axes, and this form buys the
+    first only while ``_iter_repo_runs`` pages deep enough for the second. No
+    newest-N truncation is applied here -- an orphan is an OLD run at the tail of
+    the newest-first listing, so keeping only the newest N would discard exactly
+    the runs being hunted; the page cap bounds the listing cost, and the global
+    per-tick heal cap still bounds how many runs are acted on.
     """
     seen: dict[int, dict[str, Any]] = {}
     try:
@@ -1294,6 +1307,19 @@ def list_all_candidate_runs(
     return runs
 
 
+def _heal_eligible_shape(run: dict[str, Any]) -> bool:
+    """Whether a listed run has a SHAPE a heal could act on, from the listing alone.
+
+    Priority only, never authorization. Every real gate still runs afterwards and
+    can still refuse: the workflow's concurrency group read at the run's own
+    revision, the newest-of-branch check, the saturation hold. What this reads is
+    the pair those gates cannot reverse -- a ``push`` event, because the successor
+    check filters the runs listing by branch NAME and so a pull-request run is
+    never healed, and a declared heal-safe workflow.
+    """
+    return _safe_text(run.get("event")) == "push" and _workflow_of(run) in HEAL_SAFE_WORKFLOWS
+
+
 def live_runs_within_read_bound(
     runs: list[dict[str, Any]], log: Callable[[str], None] = print
 ) -> tuple[list[dict[str, Any]], bool]:
@@ -1306,22 +1332,44 @@ def live_runs_within_read_bound(
     oldest first starves the second at exactly backlog scale, and a sweep with no
     dispatch evidence heals nothing, which is safe but useless precisely when the
     watchdog is needed. So the head of the bound goes to the oldest runs and its
-    tail is reserved for the newest. ``runs`` arrives oldest first, the two
-    slices cannot overlap once the bound is exceeded, and order is preserved.
+    tail is reserved for the newest.
+
+    Within the head, runs of ``_heal_eligible_shape`` go first. Oldest-first alone
+    ranks by age, and the oldest live runs at this repository are runs no heal can
+    ever act on: measured on this repository, 220 watched live runs sit past the
+    orphan threshold and 18 past a day, the oldest 36 days, every one of them a
+    pull-request run that stays listed and therefore re-reads the same slots on
+    every tick. A ``push`` run of a heal-safe workflow -- the only kind that can
+    be cleared, and the kind that holds a branch's concurrency slot while it is
+    stuck -- ranked 30th of 40 slots at six hours old. That margin shrinks as
+    zombies accumulate, so age is the ordering WITHIN each class rather than
+    across them.
     """
     if len(runs) <= LIVE_CLASSIFY_READS:
         return runs, False
     log(
-        f"reached the per-tick live job-read cap of {LIVE_CLASSIFY_READS}; the oldest "
-        f"{LIVE_CLASSIFY_READS - LIVE_EVIDENCE_RESERVE} are classified and the newest "
+        f"reached the per-tick live job-read cap of {LIVE_CLASSIFY_READS}; the "
+        f"{LIVE_CLASSIFY_READS - LIVE_EVIDENCE_RESERVE} classified are drawn "
+        "heal-eligible first then oldest first, and the newest "
         f"{LIVE_EVIDENCE_RESERVE} are read for dispatch evidence; the rest wait for the "
         "next tick"
     )
     oldest = LIVE_CLASSIFY_READS - LIVE_EVIDENCE_RESERVE
+    # Disjoint by construction, so a run cannot be read twice: the reserve is cut
+    # off the tail before the classify pool is drawn from what remains.
+    reserved = runs[-LIVE_EVIDENCE_RESERVE:]
+    pool = runs[:-LIVE_EVIDENCE_RESERVE]
+    eligible = [run for run in pool if _heal_eligible_shape(run)]
+    rest = [run for run in pool if not _heal_eligible_shape(run)]
+    classified = (eligible + rest)[:oldest]
+    # The caller reads jobs in the order given and the sweep's log is read
+    # chronologically, so the classify slice is handed back oldest first even
+    # though it was drawn by class.
+    classified.sort(key=lambda run: run["created_at"])
     # The second value tells the caller its saturation evidence is PARTIAL. The band
     # dropped here is the middle of the sweep, so a slow start living there is never
     # read and "nothing slow was seen" no longer rules saturation out.
-    return runs[:oldest] + runs[-LIVE_EVIDENCE_RESERVE:], True
+    return classified + reserved, True
 
 
 def list_recent_cancelled_runs(
@@ -2244,9 +2292,7 @@ def recover_cancelled_runs(
                 f"reached the per-tick cap of {RECOVERY_CLASSIFY_READS} cancelled runs to "
                 "classify; the rest are left for the next tick"
             )
-            _flag_unclassified_near_expiry(
-                cancelled_runs[index:], policy, verdicts, outcomes, log
-            )
+            _flag_unclassified_near_expiry(cancelled_runs[index:], policy, verdicts, outcomes, log)
             break
         reads_left -= 1
         try:
