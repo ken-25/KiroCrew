@@ -729,6 +729,46 @@ def _slot_visible(
     return False
 
 
+def persisted_replay_denial_reason(state: Any, slot_key: str, record: dict) -> str:
+    """``""`` when a persisted run may be replayed into *slot_key*, else the reason.
+
+    Companion to :func:`_subagent_visible` below, and it lives here for that
+    reason: that gate answers "may this app receive subagent events for this
+    slot" from the slot's CURRENT owner, which is the right question for a live
+    run and the wrong one for a run read back off disk. Slot keys are
+    caller-supplied and are not namespaced by app, so the key an app's run was
+    recorded under can later be created by a DIFFERENT app -- and the gate would
+    then admit the old run to the new owner. The run's own recorded app is the
+    missing half of the decision, so it is compared here.
+
+    Two refusals, not one, because they mean different things and an operator
+    reads the reason: ``slot_missing`` is the same reason the live gate gives when
+    no slot answers the key, which on a lazily hydrated slot is ordinary rather
+    than adversarial; ``persisted_owner_mismatch`` is a real cross-owner refusal.
+    Collapsing them would file every cold-start reconnect as a security event and
+    dilute the stream the real one has to be visible in.
+
+    Equality both ways, and fail closed. A run no app owns carries ``""``, which
+    matches only a slot no app owns, so an app never receives a person's run and
+    a person never receives an app's. ``get_slot`` is deliberate over a raw
+    ``_slots`` read: it also answers ``None`` for a slot still under
+    construction, and an admission decision must not be made against a
+    not-yet-finalized session.
+    """
+    if not slot_key:
+        return "slot_missing"
+    getter = getattr(state, "get_slot", None)
+    if callable(getter):
+        slot = getter(slot_key)
+    else:
+        slot = getattr(state, "_slots", {}).get(slot_key)
+    if slot is None:
+        return "slot_missing"
+    if str(getattr(slot, "_app", "") or "") != str(record.get("app") or ""):
+        return "persisted_owner_mismatch"
+    return ""
+
+
 def _subagent_visible(
     slot: _ChatSlot,
     app: str,
