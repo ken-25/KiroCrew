@@ -71,6 +71,7 @@ from kiro_crew.apps.manifest import (
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    scrub_env,
     wrap_argv,
     wrap_argv_async,
 )
@@ -327,6 +328,38 @@ def anonymous_git_env(**extra: str) -> dict[str, str]:
     env["LC_ALL"] = _GIT_CLONE_LOCALE
     env.update(extra)
     return env
+
+
+def _detect_probe_env() -> dict[str, str]:
+    """Environment for a ``/bin/sh -c <detectInstalled>`` probe.
+
+    A probe's command string is NOT operator-authored: it comes from an
+    app-registry manifest, which is untrusted content, and the listing path runs
+    it automatically at browse time. So a probe gets the same credential-free
+    treatment as an index-originated clone -- :func:`anonymous_git_env` -- rather
+    than the plain :func:`minimal_env` every operator-initiated spawn in this
+    module uses.
+
+    That closes three ways a probe could spend the operator's identity. The agent
+    socket and any ``GIT_SSH``/``GIT_SSH_COMMAND`` override are dropped
+    (``_GIT_CREDENTIAL_ENV_KEYS``), so manifest code cannot authenticate through
+    the operator's keys. System and global git config are disabled
+    (``GIT_CONFIG_NOSYSTEM``, ``GIT_CONFIG_GLOBAL``), so a configured credential
+    helper -- macOS ships ``osxkeychain`` in its system config, and the ``cache``
+    helper's socket is reachable through the allowlisted ``XDG_CACHE_HOME`` --
+    never fires for a manifest-chosen remote. And nothing prompts
+    (``GIT_TERMINAL_PROMPT=0``), so a probe fails instead of asking the operator
+    for a password. :func:`scrub_env` then removes the credential-bearing
+    prefixes on top.
+
+    All of this matters on one host shape: the sandbox launcher strips the socket
+    in every mode, so these keys only ever survive where no launcher runs --
+    Windows, and a POSIX host with no sandbox backend plus
+    ``agent.sandbox_allow_unsandboxed_exec``. ``PATH`` and ``HOME`` are kept, so a
+    detect command still resolves programs and still reads its own per-user
+    config.
+    """
+    return scrub_env(anonymous_git_env())
 
 
 # Manifest cache: fetched app.json files from repos
@@ -3645,6 +3678,17 @@ async def _detect_installed_probe(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                # The command string comes from a registry manifest, which is
+                # untrusted content, and `strict` mode only scrubs when the OS
+                # sandbox launcher actually runs -- not on Windows, and not on a
+                # host with no sandbox backend plus
+                # agent.sandbox_allow_unsandboxed_exec. Every other spawn in this
+                # module already passes an explicit env; these two are the gap.
+                # `_detect_probe_env` is the credential-free environment an
+                # index-originated clone gets: no agent socket, no git credential
+                # helper, no prompt. A manifest-supplied command must not be able
+                # to spend the operator's identity.
+                env=_detect_probe_env(),
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -6943,6 +6987,17 @@ async def install_from_registry(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                # The command string comes from a registry manifest, which is
+                # untrusted content, and `strict` mode only scrubs when the OS
+                # sandbox launcher actually runs -- not on Windows, and not on a
+                # host with no sandbox backend plus
+                # agent.sandbox_allow_unsandboxed_exec. Every other spawn in this
+                # module already passes an explicit env; these two are the gap.
+                # `_detect_probe_env` is the credential-free environment an
+                # index-originated clone gets: no agent socket, no git credential
+                # helper, no prompt. A manifest-supplied command must not be able
+                # to spend the operator's identity.
+                env=_detect_probe_env(),
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
