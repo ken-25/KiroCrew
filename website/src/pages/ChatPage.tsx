@@ -6,6 +6,7 @@ import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useVisualViewport } from '../hooks/useVisualViewport'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
@@ -3159,6 +3160,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // future payload change) can resolve to a non-array, and `= []` only covers
   // undefined — which crashed the whole chat page on `.find`.
   const chatFolders: ChatFolder[] = Array.isArray(chatFoldersRaw) ? chatFoldersRaw : []
+  // The sidebar's folder sort mode, for the folder-suggestion card's option list:
+  // the card draws the same tree the sidebar draws and must list it in the same
+  // order. Read here (shared kirocrewConfig query) so the card stays pure. Only
+  // the mode: a failed read is said by the sidebar's banner on this same screen.
+  const { mode: folderSortMode } = useFolderSortMode()
   const activeFolderName =
     chatFolders.find(f => f.id === currentSlot?.folder_id)?.name || ''
   // The session IDENTITY, not the display slot. `activeSlot` is the slot id
@@ -7597,13 +7603,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                             sidebar's own ['chat-folders'] cache (normalized to
                             [] on error above), so the dropdown costs no extra
                             request and degrades to a suggestion-only option
-                            list when folders are unavailable. */}
+                            list when folders are unavailable. Its option list
+                            follows the sidebar's folder order; a failed read of
+                            that order is said once per screen, by the sidebar's
+                            banner over the tree beside this composer. */}
                         <FolderSuggestionCard
                           key={folderSuggestion.ts}
                           suggestedFolderId={folderSuggestion.folderId}
                           suggestedFolderName={folderSuggestion.folderName}
                           suggestedFolderBreadcrumb={folderSuggestion.breadcrumb}
                           folders={chatFolders}
+                          folderSortMode={folderSortMode}
                           onAccept={folderSuggestionAccept}
                           onDecline={folderSuggestionDecline}
                         />

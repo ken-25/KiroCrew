@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import SendToInstanceSubmenu from './SendToInstanceSubmenu'
 import ExportSessionItem from './ExportSessionItem'
 import ImportSessionItem from './ImportSessionItem'
@@ -113,6 +114,10 @@ export default function SessionActionsMenu({
   const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const isPinned = !!slot?.pinned
   const isRunning = !!slot?.running
+  // The move-to submenu lists chat folders in the order the sidebar draws them.
+  // Only the mode is read here: a failed read is said once per screen, by the
+  // sidebar's own banner over the tree this menu opens from.
+  const { mode: folderSortMode } = useFolderSortMode()
   // Reload is also refused while sub-agent children are attached (the reset
   // would tear down their shared runtime) — mirror that in the disable so a
   // slot whose turn ended but whose children still run doesn't offer a click
@@ -158,6 +163,7 @@ export default function SessionActionsMenu({
           currentFolderId={currentFolderId}
           onPick={(folderId) => move(slotKey, folderId)}
           label={i18nT('components.sessionActionsMenu.move_to_folder')}
+          sortMode={folderSortMode}
         />
       ),
       <Item key="tags" onSelect={() => openTagPopover(slotKey)}>
