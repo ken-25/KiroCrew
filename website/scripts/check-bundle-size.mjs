@@ -96,7 +96,18 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: the recurrence landed a FOURTH time. main's tip
+  // alone (@ 927057468) builds the chunk at 13,181,750 B (12872.8 KB) against
+  // the 12870 KB ceiling -- 2.8 KB OVER with the failing branch contributing
+  // nothing, so the gate had again begun failing on the merge ref of every
+  // open PR. Attribution measured, not assumed: the surfacing branch
+  // (feat/agent-display-name) adds 2 catalog keys x 13 languages (2,348 B) and
+  // no module -- with it the chunk builds at 13,184,098 B (12875.1 KB) and
+  // still holds the same 13 catalogs plus the entry, so shrinking remains
+  // unavailable for the reason every note above states: no lazy import()
+  // boundary can move a catalog string out of `all`. Back to the 5% convention
+  // over the measurement that includes this branch.
+  all: 13520 * KB, // measured 12875.1 KB with feat/agent-display-name on main @ 927057468 2026-09-24 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
