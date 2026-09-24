@@ -1170,8 +1170,9 @@ opening the dashboard:
 - A message queued while a native Telegram turn is busy keeps native affinity when
   it drains (`interpret_commands=False` skips resume resolution). A `/session` bind
   created after enqueue therefore cannot redirect already-queued text into the
-  selected dashboard conversation. Busy resumed sessions refuse a second message
-  instead of queuing it, so the exception cannot strand resumed work.
+  selected dashboard conversation. A message queued while a RESUMED session is
+  busy records that session on its entry and drains back into it -- see
+  [A busy resumed session](#a-busy-resumed-session); it is never refused.
 - Every `/model` picker records its exact target session and re-resolves the current
   binding on press. `/new`, `/unlink`, an agent switch, or any rebind invalidates the
   old picker before `session/set_model`; only a native picker stores the route-level
@@ -1585,6 +1586,128 @@ The combined turn itself runs outside `ReceiptQueue.lock`, and the drain replays
 `handle_message(..., interpret_commands=False)`. Drained payloads therefore
 bypass both the command intercept and override parsing, so a queued `/new`
 reaches the model as literal text instead of executing on drain.
+
+### A busy resumed session
+
+A conversation bound to a dashboard session through the channel's session-switch
+command (`/session` on Telegram, `!sessions` on Discord, `/sessions` on Teams)
+runs its turns under that `dashboard:` key -- and so do the dashboard's own: the
+composer, a `session_send` from a peer, a cron injection. A message arriving while
+that session is mid-turn is **queued or steered into it, never refused**, and WHO
+holds the turn decides where it waits:
+
+- **This channel holds it** (the user asked here and follows up here, which is the
+  common case): the channel's own machinery applies unchanged -- `_session/steer`
+  into the live provider under the resumed key, or the channel queue with its
+  collapsing receipt. The queue entry additionally records the resumed session it
+  was accepted for (`queue_drain.QUEUED_RESUMED_KEY`, written by
+  `tag_resumed_entry`, read by `entry_resumed_key`), and the drain at the tail of
+  that turn passes it back as `handle_message(..., resumed_session_key=...)`. That
+  parameter exists because a drain replays with commands off, which also skips
+  resume routing (a NATIVE entry must keep native affinity even when a binding
+  appeared after it queued), so without it a replay could only re-derive the native
+  key and would answer a message accepted for the dashboard session in the wrong
+  conversation. The replay confirms, by a read-only `resumed_session` lookup and
+  never a routing decision, that the chat still resumes that key; an entry whose
+  binding was released or moved while it waited (`/unlink`, `/new`, a rebind) is
+  **dropped with a notice** -- answering it into a session the user left, or running
+  it natively in a session that never accepted it, are both worse -- the same shape
+  the dashboard drain gives a queued prompt whose admission lapsed.
+- **The dashboard holds it**: the channel queue is the wrong place to wait, because
+  it is drained only from the tail of a channel-driven turn and the dashboard turn
+  loop knows nothing of it -- an entry left there would run out of order after some
+  later channel turn, or never. So the message is handed to the slot's OWN queue,
+  the one the running turn's teardown already drains
+  (`dashboard/channel_busy.py::hand_to_dashboard_turn` ->
+  `chat_delivery.queue_for_next_turn`), stamped `directive_user_origin` (an
+  allow-listed human typed it into the bound conversation) and
+  `directive_channel_origin` (that conversation is a channel, so a directive derived
+  from it keeps channel authority) with the admission containment recorded --
+  `linked` is already held, so the drain's re-validation drops it only for a
+  constraint that appears afterwards. It runs as the next dashboard turn in arrival
+  order behind whatever the composer queued, and its reply reaches the channel
+  through the session's outbound mirror like every dashboard turn on a linked
+  session. The channel answers with a one-shot receipt rather than the collapsing
+  one, whose flip belongs to the channel's own drain. This is the queue arm ONLY:
+  the dashboard's steer path keeps its requeue provenance in per-message maps that
+  know the composer and a peer but not a channel, so a channel steer the turn never
+  consumed would be requeued as dashboard-authored text and run with the wider
+  authority. A message carrying attachments is refused with a resend prompt in this
+  case rather than queued without its files: a channel attachment is downloaded by
+  the channel turn that runs it, and the dashboard queue has no reader for one.
+  The precedent for the whole arm is Slack's linked-thread intercept
+  (`slack/handler.py`), which appends a linked thread's message to the slot queue
+  with both provenance flags the same way.
+
+The discriminator is `slot.running or slot._in_stage_execution` on the live slot
+(`channel_busy.dashboard_turn_in_progress`), the predicate the peer send path
+reads: a channel-driven turn holds the `SessionManager` lease and projects its
+result into the slot afterwards, so for it the slot reads idle. Discord, Telegram
+and Teams -- the channels that resume dashboard sessions -- all take both arms;
+the remaining channels have no resumed sessions, so the question does not arise.
+
+For a resumed session the busy test is that predicate **as well as**
+`sessions.is_busy`, not the lease alone: a dashboard plan releases the lease
+between its stages while the plan is still live, and a message arriving in that
+gap would start a turn beside the plan instead of waiting behind it. Either holder
+saying busy is busy; only the lease decides which arm runs, because a steer needs a
+live provider turn.
+
+Four further properties the arm has to hold, each pinned by a test:
+
+- **The handed-off text is prose on the dashboard.** The entry runs through the
+  dashboard turn loop, which reads a leading `/token` as a command, so a channel
+  message could otherwise run `/workflow`, `/goal` or a harness command on the
+  dashboard owner's authority -- authority that channel never offered its user, and
+  that natively the same text never gets (the channel forwards it to the model as
+  text). `chat_utils.dashboard_command_word` returns `""` for a
+  `directive_channel_origin` turn, so such a turn has no command word at all.
+- **An entry does not outlive its binding.** The binding IS the entry's reply route
+  (a resume is an inbound-capable mirror link), so `channel_busy`'s stamp records
+  the conversation on the entry (`CHANNEL_ORIGIN_META_KEY`) and the drain's
+  re-validation drops the entry when that mirror is gone at delivery
+  (`channel_binding_released`, reported as the `unlinked` constraint). A mirror
+  moved to a different conversation is the existing `mirror_retarget` constraint.
+  Entries without the stamp -- composer text, peer sends, automation -- are
+  unaffected: for them a mirror disappearing costs no reply route.
+- **The drop reaches the person who sent it.** The dashboard's own drop notice lands
+  on the slot transcript, which the channel user is not reading, and its sender
+  notice keys on a sender SLOT, which a channel has none of. So the conversation is
+  told through its own transport (`notify_channel_origin_dropped`, addressed from
+  the entry's stamp because the live link is exactly what may be gone), through the
+  same governed cross-surface ladder every proactive leg walks -- channel-scope
+  governance and the recipient allow-list are re-checked at send time. Best-effort,
+  like every other drop notice: withholding the message is the authorization
+  decision and never waits on the report. The receipt therefore promises a wait and
+  a condition, not delivery.
+- **A privacy modifier is never silently swallowed.** Telegram refuses
+  `/temporary <msg>` and `/incognito <msg>` outright while a session is resumed (a
+  dashboard slot owns its `memory_mode`), so only a drained entry can still carry
+  one into the hand-off. It is not applied -- that would announce privacy the
+  persistent slot does not honour -- and the unapplied modifier is named beside the
+  queue receipt.
+
+### Channel commands outrank the busy path
+
+The command intercept runs BEFORE the busy check on every channel, so a command
+typed while the bound session -- native OR resumed, in steer OR queue mode -- is
+mid-turn is executed by the gateway and is never queued or steered into the turn
+as text. The session-switch command is the case that matters most: a user who asked
+`who pinged me on slack today`, sees the agent busy checking, and types
+`/session <other> issue` gets the picker for the query `<other> issue` (the
+command's own grammar) and the conversation moves; nothing lands in the busy turn.
+`/new`, `/stop`, `/unlink`, `/help` and the rest behave the same. `pre_turn.py`
+states the ordering for the channels that route through `resolve_pre_turn`;
+Discord, Telegram and Teams own their ladders and keep the same order. Pinned per
+channel in `test_telegram_sessions.py`, `test_discord.py`, `test_teams_midturn.py`,
+`test_webex_dispatch.py`, `test_wecom_dispatch.py`, `test_weixin_dispatch.py`,
+`test_imessage_dispatch.py`, `test_whatsapp_dispatch.py` and
+`test_feishu_dispatch.py`.
+
+What still decides steer-vs-queue for a channel message is the static
+`messaging.queue_mode` plus the per-message overrides below. The dashboard's
+`message.steer` decision point is not yet wired for channels; what that would take
+is recorded in [decisions](decisions.md#10-mid-turn-handling-messagesteer).
 
 ### Per-message overrides
 

@@ -82,6 +82,7 @@ from kiro_crew.messaging.link import (
     ChannelLink,
     legacy_dashboard_mirror_key,
 )
+from kiro_crew.messaging.queue_drain import QUEUED_RESUMED_KEY
 from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
@@ -3279,6 +3280,236 @@ class TestDispatcher:
         await d.handle_message(self._msg("!queue later please"))
         assert [t for _, t, _ in sess.queued] == ["later please"]
         assert any("Queued" in t for t, _ in cli.sent)
+
+    # ── A busy RESUMED session: queue or steer into it, never refuse ──────
+
+    def _resumed(self, d: DiscordDispatcher) -> None:
+        d._session_resume.route = mock.AsyncMock(
+            return_value=td_mod.RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_resumed_session_steers_into_the_turn_this_channel_started(self) -> None:
+        """No dashboard turn holds the slot (there is no dashboard state at all), so
+        the running turn is this channel's own and the follow-up folds into it the
+        way a native follow-up does -- with the reaction ack and no refusal."""
+        d, cli, sess = _dispatcher({"u1"})
+        self._resumed(d)
+        sess._busy = True
+        msg = DiscordInboundMessage(
+            channel_type="discord",
+            user_id="u1",
+            conversation_id="c1",
+            text="and the weather?",
+            message_id="m42",
+        )
+
+        await d.handle_message(msg)
+
+        assert sess._gp.steered == ["and the weather?"]
+        assert sess.queued == []
+        assert cli.reactions == [("m42", _STEER_ACK_EMOJI)]
+        assert not any("busy" in t.lower() for t, _ in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_busy_resumed_session_queues_and_the_drain_replays_there(self) -> None:
+        """A queued follow-up records the resumed key; the drain runs it under that
+        key instead of re-deriving the native one, and does so without routing."""
+        d, cli, sess = _dispatcher({"u1"})
+        self._resumed(d)
+        sess._busy = True
+
+        await d.handle_message(self._msg("!queue and the weather?"))
+
+        assert sess._gp.steered == []
+        assert [t for _, t, _ in sess.queued] == ["and the weather?"]
+        assert sess.queued[0][2][QUEUED_RESUMED_KEY] == "dashboard:chat-1"
+        assert any("Queued" in t for t, _ in cli.sent)
+
+        sess._busy = False
+        d._session_resume.route.reset_mock()
+        d._session_resume.resumed_session = lambda channel_id: "dashboard:chat-1"  # type: ignore[method-assign]
+        claimed: list[str] = []
+        real_get = sess.get_or_create
+
+        async def _get(key: str, **kw: Any) -> Any:
+            claimed.append(key)
+            return await real_get(key, **kw)
+
+        sess.get_or_create = _get  # type: ignore[method-assign]
+
+        await d._drain_queue("dashboard:chat-1")
+
+        assert claimed == ["dashboard:chat-1"]
+        d._session_resume.route.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_queued_resumed_replay_is_dropped_once_the_channel_left_that_session(
+        self,
+    ) -> None:
+        d, cli, sess = _dispatcher({"u1"})
+        entry = _origin()
+        entry[QUEUED_RESUMED_KEY] = "dashboard:chat-1"
+        sess.queued.append(("1", "queued text", entry))
+        d._session_resume.resumed_session = lambda channel_id: None  # type: ignore[method-assign]
+        claimed: list[str] = []
+        real_get = sess.get_or_create
+
+        async def _get(key: str, **kw: Any) -> Any:
+            claimed.append(key)
+            return await real_get(key, **kw)
+
+        sess.get_or_create = _get  # type: ignore[method-assign]
+
+        await d._drain_queue("dashboard:chat-1")
+
+        assert claimed == []
+        assert sess.queued == []
+        assert any("Dropped" in t for t, _ in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_busy_resumed_session_hands_off_to_a_running_dashboard_turn(
+        self, monkeypatch
+    ) -> None:
+        """When the DASHBOARD holds the resumed session's turn the message goes to the
+        slot's own queue; the channel's queue and steer are left alone."""
+        from kiro_crew.dashboard import channel_busy
+
+        d, cli, sess = _dispatcher({"u1"})
+        self._resumed(d)
+        sess._busy = True
+        handed: list[tuple[str, str, bool, dict[str, Any]]] = []
+
+        def _hand(
+            state: Any, session_key: str, text: str, *, has_attachments: bool, origin: Any
+        ) -> str:
+            handed.append((session_key, text, has_attachments, origin.to_dict()))
+            return channel_busy.HANDOFF_QUEUED
+
+        monkeypatch.setattr(channel_busy, "hand_to_dashboard_turn", _hand)
+
+        await d.handle_message(self._msg("and the weather?"))
+
+        # The conversation rides along, so the drain can address a drop notice to it.
+        assert handed == [
+            (
+                "dashboard:chat-1",
+                "and the weather?",
+                False,
+                {"channel_type": "discord", "channel_id": "c1", "thread_id": None},
+            )
+        ]
+        assert sess._gp.steered == []
+        assert sess.queued == []
+        assert any("dashboard" in t for t, _ in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_message_between_a_plans_stages_waits_in_the_slot_queue(
+        self, monkeypatch
+    ) -> None:
+        """A dashboard plan releases the session lease between its stages while the
+        plan is still live. ``is_busy`` alone reads that gap as idle and would start a
+        rival turn on the resumed session, so the dashboard's own predicate decides
+        too -- and the message waits behind the plan."""
+        from kiro_crew.dashboard import channel_busy
+
+        d, cli, sess = _dispatcher({"u1"})
+        self._resumed(d)
+        sess._busy = False  # the lease is free BETWEEN stages
+        monkeypatch.setattr(
+            channel_busy, "dashboard_turn_in_progress", lambda state, session_key: True
+        )
+        handed: list[str] = []
+        monkeypatch.setattr(
+            channel_busy,
+            "hand_to_dashboard_turn",
+            lambda st, key, text, **k: (handed.append(text), channel_busy.HANDOFF_QUEUED)[1],
+        )
+
+        await d.handle_message(self._msg("and the weather?"))
+
+        assert handed == ["and the weather?"]
+        assert sess.acquired == [], "a rival turn must not start on the resumed session"
+        assert sess.queued == []
+
+    @pytest.mark.asyncio
+    async def test_attachments_are_refused_while_the_dashboard_drives(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import channel_busy
+
+        d, cli, sess = _dispatcher({"u1"})
+        self._resumed(d)
+        sess._busy = True
+        monkeypatch.setattr(
+            channel_busy,
+            "hand_to_dashboard_turn",
+            lambda *a, **k: channel_busy.HANDOFF_ATTACHMENTS_REFUSED,
+        )
+        msg = DiscordInboundMessage(
+            channel_type="discord",
+            user_id="u1",
+            conversation_id="c1",
+            text="see attached",
+            attachments=[
+                {
+                    "filename": "photo.jpg",
+                    "content_type": "image/jpeg",
+                    "size": 3,
+                    "url": "https://cdn.discordapp.com/attachments/c/m/photo.jpg",
+                }
+            ],
+        )
+
+        await d.handle_message(msg)
+
+        assert sess._gp.steered == []
+        assert sess.queued == []
+        assert any("attachments" in t for t, _ in cli.sent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("queue_mode", ["steer", "queue"])
+    @pytest.mark.parametrize(
+        "command", ["!sessions other issue", "!new", "!stop", "!unlink", "!help"]
+    )
+    async def test_commands_typed_while_the_resumed_turn_is_busy_are_executed_not_queued(
+        self, queue_mode: str, command: str
+    ) -> None:
+        """A gateway command outranks the busy path on a resumed session: the
+        session switch opens the picker for its query, the others run, and the
+        busy turn never sees the text as a queue entry or a steer."""
+        d, cli, sess = _dispatcher({"u1"})
+        d.cfg.messaging.queue_mode = queue_mode
+        _prime_live(d.cfg)
+        self._resumed(d)
+        d._session_resume.show_picker = mock.AsyncMock()
+        d._session_resume.leave_resumed_session = mock.AsyncMock(return_value="dashboard:chat-1")
+        sess._busy = True
+
+        await d.handle_message(self._msg(command))
+
+        if command.startswith("!sessions"):
+            d._session_resume.show_picker.assert_awaited_once()
+            assert d._session_resume.show_picker.await_args.kwargs["query"] == "other issue"
+        assert sess.queued == []
+        assert sess._gp.steered == []
+        assert cli.sent or command.startswith("!sessions"), command
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("queue_mode", ["steer", "queue"])
+    async def test_commands_typed_while_the_native_turn_is_busy_are_executed_not_queued(
+        self, queue_mode: str
+    ) -> None:
+        d, cli, sess = _dispatcher({"u1"})
+        d.cfg.messaging.queue_mode = queue_mode
+        _prime_live(d.cfg)
+        d._session_resume.show_picker = mock.AsyncMock()
+        sess._busy = True
+
+        await d.handle_message(self._msg("!sessions other issue"))
+        await d.handle_message(self._msg("!help"))
+
+        d._session_resume.show_picker.assert_awaited_once()
+        assert sess.queued == []
+        assert sess._gp.steered == []
 
     @pytest.mark.asyncio
     async def test_stop_cancels_and_clears_queue(self) -> None:

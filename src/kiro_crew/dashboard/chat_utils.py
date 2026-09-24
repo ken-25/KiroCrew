@@ -467,6 +467,24 @@ def user_text_span(
     return offset, offset + length
 
 
+def dashboard_command_word(message: str, *, channel_origin: bool) -> str:
+    """The leading token the dashboard may read as a COMMAND, or ``""`` for none.
+
+    A turn whose text came from a CHANNEL conversation bound to this session
+    (``channel_busy``'s hand-off, Slack's linked-thread intercept) is prose here:
+    the channel's own command intercept already ran everything that conversation
+    may command, and what it forwarded is what its user meant the model to READ --
+    natively the same text reaches the model as text. Matching it against the
+    dashboard's commands instead would let a channel message run ``/workflow``,
+    ``/goal`` or a harness command on the dashboard owner's authority, which the
+    channel never offered its user. So a channel-origin turn has no command word
+    at all, and every other turn keeps its first token exactly as before.
+    """
+    if channel_origin:
+        return ""
+    return message.split()[0] if message.strip() else ""
+
+
 def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
     """Whether *first_word* should be forwarded to the harness as a command.
 

@@ -141,6 +141,7 @@ from kiro_crew.dashboard.chat_utils import (
     build_recovery_requeue,
     chat_done_payload,
     chunk_generation,
+    dashboard_command_word,
     drained_to_thread,
     effective_session_key,
     expire_slack_options,
@@ -7361,7 +7362,9 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
     if not slot._queue:
         return
     # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard import channel_busy as _cb
     from kiro_crew.dashboard import session_control as _sc
+    from kiro_crew.dashboard.chat_utils import slot_history_key
 
     now = _sc.containment_snapshot(state, slot, on_probe_failure=True)
     _mirror_unverified = bool(now.get("mirror_unverified"))
@@ -7383,6 +7386,15 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
             q.get("meta"),
             directive_user_origin=q.get("_directive_user_origin") is True,
         )
+        # A message handed off from a channel conversation bound to this session
+        # (``channel_busy``) rides on that binding: it is the entry's reply route
+        # and the reason it was accepted. The binding is the slot's mirror link,
+        # so a mirror that is GONE at the drain -- the conversation `/unlink`ed or
+        # rotated away while the entry waited -- must drop the entry rather than
+        # answer it into a session the user left. Not a constraint for any other
+        # entry: composer text loses nothing when a mirror disappears.
+        if _cb.channel_binding_released(now, q.get("meta")):
+            changed.append(_cb.CHANNEL_UNLINKED_CONSTRAINT)
         if changed:
             doomed.append((q, changed))
     for q, changed in doomed:
@@ -7427,6 +7439,24 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
             mirror_unverified=_mirror_unverified,
         )
         _sc.audit_queued_drop(slot, q["id"], changed, origin=_origin)
+        # A CHANNEL conversation that handed this entry off (``channel_busy``) has
+        # no sender slot for the notice above and does not read this transcript;
+        # it is told through its own transport, addressed from the entry's stamp
+        # because the binding it rode in on may be exactly what is gone. Fire and
+        # forget: the send walks the governed ladder off-loop and this sweep must
+        # stay synchronous between the snapshot and the dequeue.
+        _address = _cb.channel_origin_address(_meta)
+        if _address is not None:
+            asyncio.create_task(
+                _cb.notify_channel_origin_dropped(
+                    state,
+                    slot_history_key(slot),
+                    _address,
+                    reason=_sc.describe_containment_change(
+                        changed, mirror_unverified=_mirror_unverified
+                    ),
+                )
+            )
         _log = logger.warning if _mirror_unverified and "mirrored" in changed else logger.info
         _log(
             "Dropped queued entry %s for slot %s at drain re-validation " "(newly held: %s%s)",
@@ -8000,9 +8030,13 @@ async def _start_next_queued_turn(
                 _drained_send_ids.append(_sid)
             # The admission-time containment snapshot is queue plumbing,
             # consumed by _drop_stale_admissions above; it says nothing about the
-            # ROW, so it must not ride into the persisted transcript meta.
+            # ROW, so it must not ride into the persisted transcript meta. The
+            # channel-origin address (``channel_busy.CHANNEL_ORIGIN_META_KEY``)
+            # is plumbing of the same kind, for the same sweep.
             _drained_meta.update(
-                (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
+                (k, v)
+                for k, v in _item_meta.items()
+                if k not in (QUEUED_CONTAINMENT_META_KEY, "channel_origin")
             )
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
@@ -9648,7 +9682,9 @@ async def _run_chat(
     _is_synthetic = _synthetic_payload or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
 
     # ── Slash commands: detect early, before session acquisition ──
-    first_word = message.split()[0] if message.strip() else ""
+    # Empty for a CHANNEL-origin turn: that text is prose here, never a dashboard
+    # or harness command (see ``dashboard_command_word``).
+    first_word = dashboard_command_word(message, channel_origin=_directive_channel_origin)
     _is_cc_provider = is_claude_code(KiroCrewConfig.load().agent.provider)
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
