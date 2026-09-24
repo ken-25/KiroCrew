@@ -2598,20 +2598,40 @@ def _doctor_masked_credential_aliases(issues: list[str]) -> None:
     except Exception:  # noqa: BLE001 — an unreadable mode must not hide the leaf
         confined = True
     print("\nMasked Credential Leaves")
-    for path, links in aliased:
-        if confined:
+    try:
+        live_home = str(config_dir())
+    except Exception:  # noqa: BLE001 — an unresolvable home must not hide the leaf
+        live_home = ""
+    refusing = False
+    for path, links, root in aliased:
+        # Only the live home refuses; every other spelling is reported and the spawn
+        # proceeds, because an unused home is masked by nothing while it is absent and a
+        # refusal there would be reachable from inside a sandbox. Saying "REFUSED" for one
+        # of those would send the operator after a failure that is not coming.
+        in_live = bool(live_home) and root == live_home
+        if confined and in_live:
+            refusing = True
             print(f"  alias:       ❌ agent spawns will be REFUSED — {path} ({links} links)")
-        else:
+        elif in_live:
             print(f"  alias:       ⚠️  will refuse spawns once confined — {path} ({links} links)")
+        else:
+            print(f"  alias:       ⚠️  reported, spawns proceed — {path} ({links} links)")
         # Whole tokens: the remedy names a path and a ``find`` invocation the operator
         # copies, and the default wrap splits both.
         _print_wrapped(sandbox._masked_leaf_multilink_detail(path, links))
-    if confined:
+    if refusing:
         _print_wrapped(
             "Until this is fixed every agent spawn on this host fails closed, and the "
             "only other notice is a warning in the gateway log."
         )
         issues.append("masked credential leaf alias")
+    elif confined:
+        _print_wrapped(
+            "No spawn is refused for these: they are outside the live data home, which the "
+            "launcher reports rather than refusing on, so that a file inside a home this "
+            "install does not use cannot stop every launch. Remove the extra link anyway — "
+            "the bytes are reachable under a name no mask covers."
+        )
     else:
         _print_wrapped(
             "This is not what stops a spawn on this host yet: the launcher reaches the "
