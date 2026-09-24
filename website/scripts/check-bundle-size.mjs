@@ -96,7 +96,18 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: the 5.0% headroom is spent again and this branch
+  // builds the chunk at 13,179,252 B (12,870.4 KB) against the 12870 KB ceiling
+  // -- 372 B OVER. Fourth recurrence of the note above, and attribution is
+  // measured, not assumed: this branch's only contribution to this chunk is
+  // 52 added catalog lines (10,425 B of added text) carrying four Dev Fleet
+  // read-only strings across all 13 catalogs, so main's tip alone sits roughly
+  // 10 KB under the ceiling -- 0.08% headroom -- and ordinary translated copy is
+  // what crosses it. Still no module: the chunk holds the same 13 catalogs plus
+  // the entry, and no lazy import() boundary can move a catalog string out of
+  // `all`, so shrinking remains unavailable. Back to the 5% convention over the
+  // measurement that includes this branch.
+  all: 13520 * KB, // measured 12870.4 KB on fix/dev-fleet-generic-repo-read-7428 2026-09-24 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
