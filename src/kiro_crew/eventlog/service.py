@@ -147,6 +147,67 @@ _singleton: "MemberEventLogService | None" = None
 _singleton_lock = threading.Lock()
 
 
+def _remove_legacy_activity(slug: str) -> None:
+    """Remove *slug*'s pre-log activity files. Never raises.
+
+    The companion to removing a member's unit. These rows are the member's own
+    history from before the log existed, and they sit OUTSIDE the unit while the
+    marker recording that they were folded sits inside it -- so taking the unit
+    alone both leaves the history on disk and re-arms the fold, because the next
+    fresh ``ensure`` finds no marker and reads the source again. Every name the
+    fold reads is covered: the live file, its one rotation, and the retired names
+    the fold renames them to.
+
+    **The directory name is checked AS WRITTEN, before anything resolves it, and
+    the leaves are derived from that unwritten-through path.** ``member_dir``
+    resolves and then only containment-checks the result, so ``members/<slug>``
+    swapped for a link to a PEER's directory resolves inside the members root,
+    passes that check, and hands back the peer's real directory -- where these four
+    names are ordinary files, so a link test on the leaves is false and the unlink
+    destroys a live member's history. For a member whose fold has not run that file
+    is the sole copy. ``members/<slug>`` is deliberately agent-writable, which is
+    what makes the swap reachable rather than hypothetical, and
+    ``crew_log.store.remove_unit`` refuses the same shape for the same reason. The
+    leaf test is kept as well: it costs nothing and covers a single file swapped for
+    a link without the directory being touched.
+
+    Best-effort otherwise -- a name that will not go is logged and the rest are
+    still removed, because the member's record is already gone and a cleanup must
+    not turn that into a failed delete.
+    """
+    from kiro_crew import members
+
+    try:
+        members.validate_slug(slug)
+        named_dir = members.members_root() / slug
+    except Exception:
+        logger.debug("legacy activity path unavailable for %r", slug, exc_info=True)
+        return
+    if named_dir.is_symlink():
+        logger.warning(
+            "crew log: member directory for %r is a link; refusing to remove what it names",
+            slug,
+        )
+        return
+    base = named_dir / members.ACTIVITY_FILE_NAME
+    retired = base.with_name(base.name + LEGACY_MIGRATED_SUFFIX)
+    for path in (
+        base,
+        base.with_name(base.name + ".1"),
+        retired,
+        retired.with_name(retired.name + ".1"),
+    ):
+        try:
+            if path.is_symlink():
+                logger.warning(
+                    "crew log: legacy activity at %s is a link; leaving it in place", path.name
+                )
+                continue
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("crew log: could not remove legacy activity %s for %r", path.name, slug)
+
+
 LEGACY_PROVENANCE_KEY = "legacy_unverified"
 """Marks an activity record imported from the pre-fold legacy file.
 
@@ -1077,6 +1138,18 @@ class MemberEventLogService:
         survives the removal as an answer -- the folded cells for this slug stay
         in the registry, and are unreachable through every read here, each of
         which returns empty once ``_get_log`` finds no file.
+
+        **The legacy activity source goes with the unit, and that is what makes the
+        removal mean anything.** Those rows are the member's own pre-log history,
+        they live outside the unit under ``members/<slug>/``, and the marker saying
+        they were already folded lives INSIDE it -- so a removal that took only the
+        unit would leave the history on disk AND leave the next fresh ``ensure``
+        free to fold it into a new log, in this process or any other writer's. Kept,
+        they are the thing the delete was asked to remove; taken, a later append can
+        recreate at most an empty header, which carries nothing. Best-effort and
+        symlink-refusing, like every other step of this teardown: a name that will
+        not go leaves the rest removed rather than failing a delete whose record is
+        already gone.
         """
         from kiro_crew.crew_log.store import REMOVE_REMOVED, remove_unit
 
@@ -1086,6 +1159,7 @@ class MemberEventLogService:
                 with self._map_lock:
                     self._logs.pop(slug, None)
                     self._names.pop(slug, None)
+                _remove_legacy_activity(slug)
         return status
 
     # ---- read -------------------------------------------------------------
