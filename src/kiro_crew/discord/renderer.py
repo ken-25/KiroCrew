@@ -401,6 +401,13 @@ class DiscordApprovalDecider:
     _REGISTRY: dict[str, "asyncio.Future[bool]"] = {}
     #: key -> the per-prompt nonce embedded in that prompt's buttons.
     _NONCES: dict[str, str] = {}
+    #: key -> ``(nonce, decision)`` for a press that arrived before its waiter.
+    #: The NONCE is stored with it because the key alone is reusable: a request id
+    #: repeats across prompts, so a decision recorded under the key and consumed
+    #: by a later prompt would authorize a tool nobody approved. The waiter
+    #: consumes a held decision only while the armed nonce still matches the one
+    #: the press proved, and arming a new nonce discards any held decision first.
+    _EARLY: dict[str, tuple[str, bool]] = {}
 
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
@@ -413,10 +420,30 @@ class DiscordApprovalDecider:
 
     @classmethod
     def register_nonce(cls, key: str) -> str:
-        """Mint + register the per-prompt nonce for *key* (renderer-side)."""
+        """Mint + register the per-prompt nonce for *key* (renderer-side).
+
+        Any decision held for an earlier prompt on this key is discarded here. A
+        request id repeats, and a turn cancelled between a press and its waiter
+        runs neither cleanup path, so without this a new prompt could inherit an
+        approval pressed for a different tool.
+        """
         nonce = new_approval_nonce()
+        cls._EARLY.pop(key, None)
         cls._NONCES[key] = nonce
         return nonce
+
+    @classmethod
+    def retire(cls, key: str) -> None:
+        """Drop an armed nonce whose prompt never went out (idempotent).
+
+        ``__call__`` retires the nonce together with the prompt it waited on, but
+        a caller that registers one and then fails to post — a spawn-approval
+        prompt Discord refused, or a destination whose authorization was
+        withdrawn before the send — runs no such wait, so the stale nonce would
+        otherwise outlive the prompt that never existed.
+        """
+        cls._NONCES.pop(key, None)
+        cls._EARLY.pop(key, None)
 
     async def __call__(self, event: Any) -> bool:
         self.last_deny_cause = ""
@@ -424,6 +451,20 @@ class DiscordApprovalDecider:
         fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
         DiscordApprovalDecider._REGISTRY[k] = fut
         try:
+            held = DiscordApprovalDecider._EARLY.pop(k, None)
+            if held is not None:
+                held_nonce, decision = held
+                armed = DiscordApprovalDecider._NONCES.get(k)
+                if armed and secrets.compare_digest(held_nonce, armed):
+                    # Pressed while this prompt was going out, before this waiter
+                    # existed. The nonce it proved is still the armed one, so the
+                    # decision belongs to THIS prompt, and answering it here is
+                    # what keeps a real press from being reported as expired.
+                    return bool(decision)
+                # Held under the same reusable key but for a DIFFERENT prompt.
+                # Discard it: honouring it would approve a tool whose own prompt
+                # nobody answered.
+                logger.info("Discord: discarded a held approval whose nonce is not the armed one")
             return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
         except asyncio.TimeoutError:
             # Recorded for the driver, which steers the cause into the turn
@@ -448,19 +489,35 @@ class DiscordApprovalDecider:
         finally:
             DiscordApprovalDecider._REGISTRY.pop(k, None)
             # Retire the prompt's nonce with the decision window: a press on
-            # the (now stale) buttons can never resolve a future request.
+            # the (now stale) buttons can never resolve a future request. A held
+            # decision goes with it, so nothing survives the window either.
             DiscordApprovalDecider._NONCES.pop(k, None)
+            DiscordApprovalDecider._EARLY.pop(k, None)
 
     @classmethod
     def resolve_global(cls, key: str, approved: bool, *, nonce: str = "") -> bool:
-        """Resolve a pending approval by key. Returns True iff one was waiting
-        AND the button's nonce matches the registered per-prompt nonce."""
+        """Resolve a pending approval by key. Returns True iff the button's nonce
+        matches the registered per-prompt nonce AND the decision was either
+        handed to a waiting future or held for the waiter about to register one.
+
+        The nonce is armed when the prompt is BUILT but the future only registers
+        when the caller starts awaiting, and the post in between suspends, so a
+        fast press can land in that gap. Dropping it there would deny-by-default
+        at the timeout and tell the user the approval expired when they had in
+        fact answered it. A nonce-matched press is therefore held under the same
+        key, STORED WITH THE NONCE it proved, and consumed by the waiter only
+        while that nonce is still the armed one -- a request id repeats, so a
+        decision consumed by a later prompt would approve a tool nobody answered.
+        """
         expected = cls._NONCES.get(key)
         if not expected or not nonce or not secrets.compare_digest(nonce, expected):
             return False  # stale/foreign button — fail closed
         fut = cls._REGISTRY.get(key)
         if fut is not None and not fut.done():
             fut.set_result(bool(approved))
+            return True
+        if fut is None:
+            cls._EARLY[key] = (expected, bool(approved))
             return True
         return False
 

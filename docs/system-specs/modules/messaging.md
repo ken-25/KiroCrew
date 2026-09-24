@@ -408,6 +408,44 @@ order (channel hook → Slack-DM/dashboard fallback → the #8914 fast-fail back
 the operator-log-vs-agent-error security split are documented in
 [`subagent.md`](subagent.md).
 
+**Discord is the second opt-in, and it is not identical.**
+`DiscordDispatcher.deliver_spawn_approval` posts the existing Approve/Deny buttons
+and awaits the press through the same `on_interaction` `a:` path, registered in
+`discord/gateway.py` on startup and unregistered from the client's `on_close` hook.
+Three differences from the Telegram reference are load-bearing. Discord's ladder has
+**no Trust rung**, so there is no in-channel way to grant standing spawn trust here —
+the operator grants it from the dashboard. A `unified` dm_scope collapses several
+peers into one session key, which names no single conversation, so such a key is
+unaddressable and falls through. And this client reports a refused send by
+**returning no message id** rather than by raising, so an absent id is read the same
+way as an exception: nothing was surfaced, fall through.
+
+**The channels governance ceiling is the seam's gate, read once for every hook.**
+`spawn_approval_delivery` consults `channel_inbound_permitted` after it resolves the
+hook and before it invokes one, and a deny answers `None` so the host gate falls
+through. It belongs there rather than inside each dispatcher: every hook posts a
+prompt whose answering press arrives inbound on the same channel, a denied channel
+drops that press, and a copy per implementation is the same authority duplicated
+where the next hook written without it reopens the hole.
+
+Discord adds ONE further read of its own, which is not that authority again. On the
+direct route the peer's DM channel is opened INSIDE the hook; that open is a full
+round trip, so the seam's answer can go stale across it and the seam cannot observe
+that happening. The dispatcher therefore re-reads immediately after the open, where
+everything remaining before the send is synchronous, which makes it the latest point
+a read can speak for. A thread route arrives with its channel already resolved,
+never suspends, and takes no re-read.
+
+**A press that lands before its waiter exists is held, not dropped.** Both Discord
+prompt paths arm the per-prompt nonce when the prompt is BUILT, while the future that
+receives the decision only registers when the caller starts awaiting, and the post in
+between suspends. `DiscordApprovalDecider.resolve_global` therefore holds a
+nonce-matched press under the same key and the waiter consumes it, rather than finding
+no future and failing closed — which would deny-by-default at the timeout and tell a
+user who pressed Approve that the approval had expired. A held decision is dropped in
+exactly the two places the nonce is dropped, so it can never resolve a later request,
+which is the property the nonce guard exists to protect.
+
 ## Layer 2b — `Renderer` + `OutputEvent` (`renderer.py`)
 
 ### `OutputEvent`
