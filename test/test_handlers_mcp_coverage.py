@@ -29,6 +29,7 @@ from body_stream_helpers import BodyStreamPayload
 from dashboard_owner_helpers import owner_claims
 
 from conftest import host_abs
+from kiro_crew.config.paths import display_path
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.mcp_discovery import McpServerInfo
 
@@ -213,6 +214,28 @@ class TestToggleServer:
         assert resp.status == 200
         assert "disabled" not in _read_global(sandbox)["srv"]
         assert sandbox.synced == [("srv", True, False)]
+
+    @pytest.mark.asyncio
+    async def test_toggle_mutes_the_raw_slash_named_entry_the_row_stands_for(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The table asks by the canonical alias; the file holds the raw key.
+        The flag lands on the raw entry -- the one the rebuild mounts -- and no
+        stub is written beside it. Red under ``name not in servers``: a
+        ``{"disabled": true}`` stub under ``playwright-mcp`` showed the row
+        Disabled while ``npm:@playwright/mcp`` kept mounting untouched."""
+        _write_global(sandbox, {"npm:@playwright/mcp": {"command": "npx"}})
+        resp = await mcp_mod.api_mcp_toggle(
+            _request({"name": "playwright-mcp", "enabled": False})
+        )
+        assert resp.status == 200
+        servers = _read_global(sandbox)
+        assert set(servers) == {"npm:@playwright/mcp"}
+        assert servers["npm:@playwright/mcp"]["disabled"] is True
+        # And back on, through the same resolution.
+        resp = await mcp_mod.api_mcp_toggle(_request({"name": "playwright-mcp", "enabled": True}))
+        assert resp.status == 200
+        assert "disabled" not in _read_global(sandbox)["npm:@playwright/mcp"]
 
     @pytest.mark.asyncio
     async def test_server_known_elsewhere_gets_a_stub_entry(
@@ -816,6 +839,39 @@ class TestActive:
         assert rows[0]["name"].startswith("kirocrew-")
 
     @pytest.mark.asyncio
+    async def test_default_agent_reads_the_store_and_the_row_flag_not_only_the_shared_file(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registry install awaiting consent is ``disabled: true`` in the Kiro
+        Crew store and absent from the shared file; a server switched off in a
+        provider global is in neither map. Both are off for the sessions, so
+        both answer ``enabled: false`` here. Red under the shared-file-only read,
+        which answered ``true`` for each."""
+        import kiro_crew.mcp_discovery as disc
+
+        _write_global(sandbox, {"on": {"command": "x"}})
+        store = mcp_mod._kirocrew_mcp_json()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps({"mcpServers": {"pending": {"command": "y", "disabled": True}}}),
+            encoding="utf-8",
+        )
+        # ``pending`` carries no row flag here, so only the store read can flip
+        # it; ``cc-off`` is in neither map, so only the row flag can.
+        rows = [
+            McpServerInfo(name="on", command="/bin/true"),
+            McpServerInfo(name="pending", command="/bin/true"),
+            McpServerInfo(name="cc-off", command="/bin/true", disabled=True),
+        ]
+        monkeypatch.setattr(disc, "list_servers", lambda *a, **k: list(rows))
+        resp = await mcp_mod.api_mcp_active(_request(query={}))
+        assert resp.status == 200
+        by_name = {r["name"]: r["enabled"] for r in _payload(resp)}
+        assert by_name["on"] is True
+        assert by_name["pending"] is False
+        assert by_name["cc-off"] is False
+
+    @pytest.mark.asyncio
     async def test_agent_alias_resolves_to_the_global_scope(
         self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -898,6 +954,358 @@ class TestProbe:
         monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
         resp = await mcp_mod.api_mcp_probe(_request({}))
         assert _payload(resp)[0]["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_live_probe_rows_carry_the_same_config_state_as_the_list(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The probe response REPLACES the table's list on the client,
+        so its rows must say what ``GET /api/mcp`` says. A store-disabled
+        (consent) row and a row ``list_servers`` flagged disabled from another
+        scope both read disabled, and ``kirocrewManaged`` rides along so the
+        Edit action does not vanish between a probe and the next GET."""
+        import kiro_crew.mcp_discovery as disc
+
+        _write_global(sandbox, {"on": {"command": "x"}})
+        store = mcp_mod._kirocrew_mcp_json()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "on": {"command": "x"},
+                        "consent": {"command": "y", "disabled": True},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            disc,
+            "probe_all",
+            AsyncMock(
+                return_value=[
+                    _probed("on"),
+                    _probed("consent", status="disabled", disabled=True),
+                    # Disabled in a scope neither file above holds: only the
+                    # row's own aggregate flag says so.
+                    _probed("shared-off", status="disabled", disabled=True),
+                ]
+            ),
+        )
+        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
+        monkeypatch.setattr(mcp_mod, "_mcp_probe_ts", 0.0)
+
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_probe(_request({})))}
+        assert rows["on"]["enabled"] is True
+        assert rows["on"]["kirocrewManaged"] is True
+        assert rows["on"]["disabledIn"] is None
+        assert rows["consent"]["enabled"] is False
+        assert rows["consent"]["status"] == "disabled"
+        assert rows["consent"]["kirocrewManaged"] is True
+        # The store's own flag: the consent step in the table lifts it.
+        assert rows["consent"]["disabledIn"] == "kirocrew"
+        assert rows["consent"]["disabledInFile"] is None
+        assert rows["shared-off"]["enabled"] is False
+        assert rows["shared-off"]["status"] == "disabled"
+        assert rows["shared-off"]["kirocrewManaged"] is False
+        # Only the aggregate flag says so: inert here, and no file to name.
+        assert rows["shared-off"]["disabledIn"] == "shared"
+        assert rows["shared-off"]["disabledInFile"] is None
+
+    @pytest.mark.asyncio
+    async def test_live_probe_survives_a_non_mapping_store(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hand-edited store whose ``mcpServers`` is a list must not turn the
+        probe response into a 500 after the fan-out already ran: it reads as an
+        empty map, so the row keeps the state the other sources give it."""
+        import kiro_crew.mcp_discovery as disc
+
+        _write_global(sandbox, {"on": {"command": "x"}})
+        store = mcp_mod._kirocrew_mcp_json()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({"mcpServers": []}), encoding="utf-8")
+        monkeypatch.setattr(disc, "probe_all", AsyncMock(return_value=[_probed("on")]))
+        monkeypatch.setattr(mcp_mod, "_mcp_probe_cache", [])
+
+        resp = await mcp_mod.api_mcp_probe(_request({}))
+        assert resp.status == 200
+        row = _payload(resp)[0]
+        assert row["enabled"] is True
+        assert row["kirocrewManaged"] is False
+
+    def test_stamp_config_state_tolerates_non_mapping_inputs(self) -> None:
+        d: dict[str, Any] = {"name": "srv", "status": "ok"}
+        mcp_mod._stamp_config_state(d, [], "not a map")
+        assert d["enabled"] is True
+        assert d["kirocrewManaged"] is False
+        assert d["status"] == "ok"
+        assert d["disabledIn"] is None
+        assert d["disabledInFile"] is None
+
+    def test_stamp_config_state_names_the_scope_that_disabled_the_row(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """``disabledIn`` is the backend's own answer to "which config switched
+        this off", so the table never infers it from ``enabled`` +
+        ``kirocrewManaged``. The shared Kiro-global flag names its file; the
+        store's flag is the consent state the table can lift itself."""
+        shared: dict[str, Any] = {"name": "figma", "status": "ok"}
+        mcp_mod._stamp_config_state(shared, {"figma": {"command": "x", "disabled": True}}, {})
+        assert shared["enabled"] is False
+        assert shared["status"] == "disabled"
+        assert shared["disabledIn"] == "shared"
+        assert shared["disabledInFile"] == display_path(mcp_mod._GLOBAL_MCP_JSON)
+        assert shared["disabledInFile"].endswith("mcp.json")
+
+        consent: dict[str, Any] = {"name": "weather", "status": "ok"}
+        mcp_mod._stamp_config_state(consent, {}, {"weather": {"command": "y", "disabled": True}})
+        assert consent["enabled"] is False
+        assert consent["kirocrewManaged"] is True
+        assert consent["disabledIn"] == "kirocrew"
+        assert consent["disabledInFile"] is None
+
+    def test_stamp_config_state_dual_scope_disable_reads_shared(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """A store-managed server that the SHARED config disables is inert, not a
+        consent row: lifting the store's flag (the consent step) would leave the
+        shared flag standing, so the table must not offer it. Both flags set
+        reads the same way, for the same reason."""
+        managed_shared_off: dict[str, Any] = {"name": "figma", "status": "ok"}
+        mcp_mod._stamp_config_state(
+            managed_shared_off,
+            {"figma": {"command": "x", "disabled": True}},
+            {"figma": {"command": "x"}},
+        )
+        assert managed_shared_off["kirocrewManaged"] is True
+        assert managed_shared_off["enabled"] is False
+        assert managed_shared_off["disabledIn"] == "shared"
+        assert managed_shared_off["disabledInFile"] == display_path(
+            mcp_mod._GLOBAL_MCP_JSON
+        )
+
+        both_off: dict[str, Any] = {"name": "figma", "status": "ok"}
+        mcp_mod._stamp_config_state(
+            both_off,
+            {"figma": {"command": "x", "disabled": True}},
+            {"figma": {"command": "x", "disabled": True}},
+        )
+        assert both_off["disabledIn"] == "shared"
+
+    def test_stamp_config_state_provider_global_plus_store_disable_reads_shared(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """A server disabled in a PROVIDER global (a scope this helper never
+        reads) and in the store is inert, not a consent row: ``list_servers``
+        records the provider-global mute on the row (``disabledInShared``), and
+        that verdict outranks the store flag the two maps in hand explain. Red
+        under ``store_off and not shared_off -> "kirocrew"``, which offered a
+        consent step that lifted the store flag and left the provider-global one
+        standing. The row's marker is consumed, not forwarded."""
+        row: dict[str, Any] = {
+            "name": "figma",
+            "status": "ok",
+            "disabled": True,
+            "disabledInShared": True,
+        }
+        mcp_mod._stamp_config_state(row, {}, {"figma": {"command": "x", "disabled": True}})
+        assert row["kirocrewManaged"] is True
+        assert row["enabled"] is False
+        assert row["disabledIn"] == "shared"
+        # Not the Kiro-global file: the helper cannot name a provider global.
+        assert row["disabledInFile"] is None
+        assert row["disabledReason"] is None
+        assert "disabledInShared" not in row
+        # The same store flag WITHOUT the row's verdict is the consent row.
+        consent: dict[str, Any] = {"name": "figma", "status": "ok", "disabled": True}
+        mcp_mod._stamp_config_state(consent, {}, {"figma": {"command": "x", "disabled": True}})
+        assert consent["disabledIn"] == "kirocrew"
+
+    def test_stamp_config_state_resolves_a_slash_named_entry_by_its_alias(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The row is canonical (``playwright-mcp``), the files keep the key as
+        written (``npm:@playwright/mcp``). Both maps are read by alias too, so
+        the shared disable is seen, the file is named, and the store entry
+        counts as managed. Red under ``global_mcps.get(name)``: the row stamped
+        from nothing -- ``enabled: true`` beside a launch gate that refused it,
+        and no Edit action for a store it does own."""
+        row: dict[str, Any] = {"name": "playwright-mcp", "status": "ok", "disabled": True}
+        mcp_mod._stamp_config_state(
+            row,
+            {"npm:@playwright/mcp": {"command": "npx", "disabled": True}},
+            {"npm:@playwright/mcp": {"command": "npx"}},
+        )
+        assert row["kirocrewManaged"] is True
+        assert row["enabled"] is False
+        assert row["disabledIn"] == "shared"
+        assert row["disabledInFile"] == display_path(mcp_mod._GLOBAL_MCP_JSON)
+        # Both spellings in one file: the muted one decides (fail-closed).
+        both: dict[str, Any] = {"name": "playwright-mcp", "status": "ok", "disabled": True}
+        mcp_mod._stamp_config_state(
+            both,
+            {
+                "playwright-mcp": {"command": "npx"},
+                "npm:@playwright/mcp": {"command": "npx", "disabled": "false"},
+            },
+            {},
+        )
+        assert both["enabled"] is False
+        assert both["disabledReason"] == "invalid"
+
+    def test_stamp_config_state_reads_a_non_boolean_disabled_fail_closed(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """``"disabled": "false"`` (a string) is a config error read FAIL-CLOSED
+        by the launch predicate the stamping shares with the sessions: the row is
+        off in both the shared and the store map, and says WHY --
+        ``disabledReason == "invalid"`` -- so the table can name the value to
+        repair rather than a switch to flip. A literal ``True`` is a real switch
+        and carries no reason. Red under the ``is True`` read this replaced,
+        which listed the row enabled beside a gate that refused to start it."""
+        for value in ("false", "true", 1, "yes", None):
+            shared: dict[str, Any] = {"name": "srv", "status": "ok"}
+            mcp_mod._stamp_config_state(shared, {"srv": {"command": "x", "disabled": value}}, {})
+            assert shared["enabled"] is False, value
+            assert shared["status"] == "disabled", value
+            assert shared["disabledIn"] == "shared", value
+            assert shared["disabledInFile"] == display_path(mcp_mod._GLOBAL_MCP_JSON)
+            assert shared["disabledReason"] == "invalid", value
+            store: dict[str, Any] = {"name": "srv", "status": "ok"}
+            mcp_mod._stamp_config_state(store, {}, {"srv": {"command": "x", "disabled": value}})
+            assert store["enabled"] is False, value
+            assert store["kirocrewManaged"] is True, value
+            assert store["disabledIn"] == "kirocrew", value
+            assert store["disabledReason"] == "invalid", value
+        # A real switch: off, and no reason to add. An enabled row carries the
+        # key too, as ``None``, so a client never reads absence as a reason.
+        real: dict[str, Any] = {"name": "srv", "status": "ok"}
+        mcp_mod._stamp_config_state(real, {"srv": {"command": "x", "disabled": True}}, {})
+        assert real["enabled"] is False
+        assert real["disabledReason"] is None
+        on: dict[str, Any] = {"name": "srv", "status": "ok"}
+        mcp_mod._stamp_config_state(on, {"srv": {"command": "x", "disabled": False}}, {})
+        assert on["enabled"] is True
+        assert on["disabledReason"] is None
+        # The aggregate flag ``list_servers`` stamps is the one other disable
+        # source; neither map in hand explains it, so its reason is the row's
+        # own verdict -- carried when ``list_servers`` set it, ``None`` otherwise.
+        aggregate: dict[str, Any] = {"name": "srv", "status": "ok", "disabled": True}
+        mcp_mod._stamp_config_state(aggregate, {}, {})
+        assert aggregate["enabled"] is False
+        assert aggregate["disabledIn"] == "shared"
+        assert aggregate["disabledInFile"] is None
+        assert aggregate["disabledReason"] is None
+        aggregate_invalid: dict[str, Any] = {
+            "name": "srv",
+            "status": "ok",
+            "disabled": True,
+            "disabledReason": "invalid",
+        }
+        mcp_mod._stamp_config_state(aggregate_invalid, {}, {})
+        assert aggregate_invalid["disabledIn"] == "shared"
+        assert aggregate_invalid["disabledReason"] == "invalid"
+
+    def test_enable_lifts_a_non_boolean_disabled_in_the_store(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The consent step must be able to land on a row the fail-closed read
+        shows as Disabled: enabling lifts WHATEVER mutes the store entry, not
+        only a literal ``true`` -- under the ``is True`` test the string stayed
+        put as a "noop" and the row could never be switched on from here. The
+        disable direction still writes the boolean over an odd value (a repair),
+        and a spec edit keeps a muted entry muted, as the boolean."""
+        store = mcp_mod._kirocrew_mcp_json()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps({"mcpServers": {"srv": {"command": "x", "disabled": "false"}}}),
+            encoding="utf-8",
+        )
+        assert mcp_mod._set_kirocrew_entry("srv", enabled=True) == "enabled"
+        assert "disabled" not in json.loads(store.read_text())["mcpServers"]["srv"]
+        # Disable over an odd value: written as the boolean, not a no-op.
+        store.write_text(
+            json.dumps({"mcpServers": {"srv": {"command": "x", "disabled": "yes"}}}),
+            encoding="utf-8",
+        )
+        assert mcp_mod._set_kirocrew_entry("srv", enabled=False) == "disabled"
+        assert json.loads(store.read_text())["mcpServers"]["srv"]["disabled"] is True
+        assert mcp_mod._set_kirocrew_entry("srv", enabled=False) == "noop"
+        # A spec edit is not consent: the mute survives, as the boolean.
+        store.write_text(
+            json.dumps({"mcpServers": {"srv": {"command": "x", "disabled": "false"}}}),
+            encoding="utf-8",
+        )
+        assert mcp_mod._replace_kirocrew_spec("srv", {"command": "y", "disabled": "false"})
+        assert json.loads(store.read_text())["mcpServers"]["srv"] == {
+            "command": "y",
+            "disabled": True,
+        }
+        # The same lift for a provider-global file.
+        shared = sandbox.global_json
+        shared.write_text(
+            json.dumps({"mcpServers": {"srv": {"command": "x", "disabled": None}}}),
+            encoding="utf-8",
+        )
+        assert mcp_mod._set_scope_entry(shared, "srv", enabled=True) == "enabled"
+        assert "disabled" not in json.loads(shared.read_text())["mcpServers"]["srv"]
+
+    def test_uninstall_by_alias_removes_the_raw_slash_named_entry_everywhere(
+        self, sandbox: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uninstall carries the row's canonical name; the store and the shared
+        file hold the raw ``npm:@...`` key. Every key that names the server goes,
+        in every scope and in the rendered agent file. Red under
+        ``name not in servers``: both scopes answered ``noop`` and the
+        definitions stayed while the table reported the row removed."""
+        import kiro_crew.dashboard.handlers.mcp as handler
+
+        store = mcp_mod._kirocrew_mcp_json()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps({"mcpServers": {"npm:@playwright/mcp": {"command": "npx"}}}),
+            encoding="utf-8",
+        )
+        _write_global(
+            sandbox,
+            {
+                "npm:@playwright/mcp": {"command": "npx", "disabled": True},
+                "playwright-mcp": {"disabled": True},
+                "other": {"command": "y"},
+            },
+        )
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        rendered = agents_dir / "kirocrew.json"
+        rendered.write_text(
+            json.dumps({"mcpServers": {"playwright-mcp": {"command": "npx"}}}), encoding="utf-8"
+        )
+        monkeypatch.setattr(handler, "kiro_agents_dir", lambda: agents_dir)
+        actions = mcp_mod._purge_server_config("playwright-mcp")
+        assert actions == {"kirocrew": "removed", "kiroGlobal": "removed"}
+        assert json.loads(store.read_text())["mcpServers"] == {}
+        assert _read_global(sandbox) == {"other": {"command": "y"}}
+        assert json.loads(rendered.read_text())["mcpServers"] == {}
+        # Idempotent: a second purge finds nothing.
+        assert mcp_mod._purge_server_config("playwright-mcp") == {
+            "kirocrew": "noop",
+            "kiroGlobal": "noop",
+        }
+
+    def test_display_path_collapses_the_home_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One rule, shared with ``handlers/steering.py`` through
+        ``config.paths.display_path`` -- so a response from either panel never
+        carries the account name a file sits under."""
+        import kiro_crew.config.paths as paths_mod
+
+        home = Path("/srv/people/someone")
+        monkeypatch.setattr(paths_mod.Path, "home", classmethod(lambda cls: home))
+        assert display_path(home / ".kiro" / "settings" / "mcp.json") == str(
+            Path("~") / ".kiro" / "settings" / "mcp.json"
+        )
+        assert display_path(Path("/etc/mcp.json")) == str(Path("/etc/mcp.json"))
 
     @pytest.mark.asyncio
     async def test_cached_probe_returns_the_warm_cache_without_reprobing(
@@ -2578,6 +2986,54 @@ class TestMeasureProgressPayload:
         # The in-flight pass's own numbers, not a reset: the operator pressing a
         # second time is still watching the first pass.
         assert (body["measured"], body["done"], body["total"]) == (1, 1, 4), body
+
+    @pytest.mark.asyncio
+    async def test_measure_all_survives_a_disabled_row_with_a_malformed_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One disabled row whose config is malformed must not take the pass down.
+
+        The probe response carries a disabled server as an unprobed placeholder so
+        the table can list it, and Measure All feeds that response straight to the
+        evaluator. A disabled row with a dict for ``command`` made the evaluator
+        raise before its per-server boundary, so the readout closed on
+        ``AttributeError`` with nothing measured. The healthy row is measured and
+        the readout closes clean; the disabled row is never spawned.
+        """
+        import kiro_crew.mcp_discovery as disc
+        import kiro_crew.mcp_gateway.evaluate as ev
+
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        monkeypatch.setattr(mcp_mod, "records_dir", lambda _socket: runtime)
+        rows = [
+            McpServerInfo(name="good-mcp", command="/bin/true", status="ok"),
+            McpServerInfo(
+                name="off-mcp", command={"not": "a string"}, disabled=True, status="disabled"
+            ),
+        ]
+
+        async def _probe_all(**_kw):
+            return list(rows)
+
+        monkeypatch.setattr(disc, "probe_all", _probe_all)
+        spawned: list[str] = []
+
+        async def _preflight(server):
+            spawned.append(server.name)
+            return SimpleNamespace(ran=True, caller_sensitive=False, reasons=())
+
+        monkeypatch.setattr(ev, "preflight", _preflight)
+        for key, value in (("running", True), ("done", 0), ("measured", 0), ("error", "")):
+            monkeypatch.setitem(mcp_mod._measure_progress, key, value)
+
+        await mcp_mod._bg_measure_all()
+
+        progress = dict(mcp_mod._measure_progress)
+        assert progress["error"] == "", progress
+        assert (progress["measured"], progress["done"]) == (1, 1), progress
+        assert progress["running"] is False
+        assert spawned == ["good-mcp"]
 
 
 class TestStubEligibility:

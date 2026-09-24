@@ -46,6 +46,7 @@ from kiro_crew.atomic_write import (
     open_access_control_source,
     pinned_parent_replace_supported,
 )
+from kiro_crew.config.paths import display_path
 from kiro_crew.context import steering_target_admissible
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor
@@ -193,14 +194,6 @@ def _redact_meta(text: str) -> str:
     return out
 
 
-def _display_path(path: Path | str) -> str:
-    """Collapse the real home prefix to ``~`` so responses never leak it."""
-    out = str(path)
-    for home in {str(Path.home()), str(Path.home().resolve())}:
-        out = out.replace(home, "~")
-    return out
-
-
 def steering_roots(project_dir: Path | None = None) -> list[tuple[str, Path]]:
     """Return ``(source, path)`` pairs for the steering locations.
 
@@ -333,7 +326,7 @@ def list_steering_blocking(project_dir: Path | None = None) -> dict[str, Any]:
         exists = root.is_dir()
         roots.append({
             "source": source,
-            "path": _redact_meta(_display_path(root)),
+            "path": _redact_meta(display_path(root)),
             "exists": exists,
         })
         if not exists:
@@ -401,7 +394,7 @@ def list_steering_blocking(project_dir: Path | None = None) -> dict[str, Any]:
                 "name": entry.name,
                 "rel": rel,
                 "source": source,
-                "path": _redact_meta(_display_path(entry)),
+                "path": _redact_meta(display_path(entry)),
                 "size": size,
                 "description": _redact_meta(meta["description"]),
                 # ``inclusion`` comes from a closed vocabulary, so it needs no
@@ -411,12 +404,12 @@ def list_steering_blocking(project_dir: Path | None = None) -> dict[str, Any]:
                 "file_match_pattern": _redact_meta(meta["file_match_pattern"]),
                 "linked": linked,
                 "editable": not linked,
-                "target": _redact_meta(_display_path(resolved)) if linked else "",
+                "target": _redact_meta(display_path(resolved)) if linked else "",
             })
     return {
         "files": files,
         "roots": roots,
-        "project": _redact_meta(_display_path(project_dir)) if project_dir else "",
+        "project": _redact_meta(display_path(project_dir)) if project_dir else "",
     }
 
 
@@ -621,7 +614,7 @@ def _resolve_and_read_blocking(key: str, project_dir: Path | None) -> tuple[str,
     target = resolve_steering_file(key, project_dir, follow_links=True)
     if target is None:
         return "", "", "notfound"
-    display = _redact_meta(_display_path(target))
+    display = _redact_meta(display_path(target))
     parts = _split_key(key)
     root = (
         next((p for s, p in steering_roots(project_dir) if s == parts[0]), None) if parts else None
@@ -661,7 +654,7 @@ def _resolve_and_read_blocking(key: str, project_dir: Path | None) -> tuple[str,
 
 def _create_file_blocking(target: Path, content: str) -> tuple[str | None, str]:
     """Create *target* with *content*; return ``(error token or None, display path)``."""
-    display = _redact_meta(_display_path(target))
+    display = _redact_meta(display_path(target))
     if not _DIR_FD_SUPPORTED:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)

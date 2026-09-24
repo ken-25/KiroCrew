@@ -902,6 +902,22 @@ def project_kiro_dir(project_dir: str | Path) -> Path:
     return Path(project_dir) / ".kiro"
 
 
+def display_path(path: str | Path) -> str:
+    """*path* as a dashboard response shows it: the real home collapsed to ``~``.
+
+    The one rule for a path a response names for the USER to act on -- the file
+    a steering document lives in, the MCP config a disabled row points at -- so
+    the account name it sits under never rides along. Both spellings of home are
+    collapsed, as configured and as resolved through symlinks, because a path can
+    arrive in either. Display only: it is not a redaction of the path's other
+    components, and nothing reads it back.
+    """
+    out = str(path)
+    for home in {str(Path.home()), str(Path.home().resolve())}:
+        out = out.replace(home, "~")
+    return out
+
+
 def _default_workspace_base() -> Path:
     """Return the platform-specific default base for the workspace."""
     if sys.platform == "darwin":
