@@ -55,10 +55,12 @@ vi.mock('../../api/client', () => ({
 import { useComposerVoice, composerVoiceInputProps, _resetMicOwner } from './useComposerVoice'
 
 const STT_STREAMING = { enabled: true, available: true, streaming: true, dictation_panel: true, provider: 'local' }
+/** Batch: one blob, one final, routed to the slot that dictated it. */
+const STT_BATCH = { ...STT_STREAMING, streaming: false }
 
-function makeWrapper() {
+function makeWrapper(cfg: typeof STT_STREAMING = STT_STREAMING) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  qc.setQueryData(['sttConfig'], STT_STREAMING)
+  qc.setQueryData(['sttConfig'], cfg)
   return function Wrapper({ children }: { children: ReactNode }) {
     return <QueryClientProvider client={qc}>{children}</QueryClientProvider>
   }
@@ -66,20 +68,27 @@ function makeWrapper() {
 
 const SESSION = 'slot-a'
 
-function mount() {
+function mount(cfg: typeof STT_STREAMING = STT_STREAMING) {
   const inputRef = { current: '' }
+  // The slot on screen, readable by the hook and movable by the test: a switch is
+  // this composer re-rendering with another session, not a second composer.
+  const slot = { current: SESSION }
+  fx.engine.streamEnabled = cfg.streaming
   const hook = renderHook(
-    () => useComposerVoice({ sessionId: SESSION, inputRef, setInput: (v: string) => { inputRef.current = v } }),
-    { wrapper: makeWrapper() },
+    () => useComposerVoice({ sessionId: slot.current, inputRef, setInput: (v: string) => { inputRef.current = v } }),
+    { wrapper: makeWrapper(cfg) },
   )
-  return { hook, inputRef }
+  const switchTo = (sessionId: string) => { slot.current = sessionId; act(() => { hook.rerender() }) }
+  return { hook, inputRef, switchTo }
 }
 
 beforeEach(() => {
   _resetMicOwner()
   const e = fx.engine
   e.recording = false; e.transcribing = false; e.draining = false; e.sessionOwner = null; e.partial = ''
+  e.streamEnabled = true
   e.cancel = vi.fn()
+  e.toggle = vi.fn()
   fx.captured.onText = undefined
   fx.captured.onPartial = undefined
 })
@@ -174,5 +183,60 @@ describe('useComposerVoice — a drain discard is final', () => {
     act(() => { void hook.result.current.startVoice() })
     act(() => { fx.captured.onText?.('the next utterance', SESSION, 'stream') })
     expect(inputRef.current).toContain('the next utterance')
+  })
+})
+
+describe('useComposerVoice — leaving the slot mid-drain does not strand the engine', () => {
+  it('discards the queued utterance, whose only back-out left with the slot', () => {
+    // Escape reaches the drain through the OWNING composer. Switch chats and that
+    // composer is gone from the screen, so an engine left running holds the
+    // microphone with nothing able to release it.
+    const { hook, switchTo } = mount()
+    enterDrain(hook)
+    switchTo('slot-b')
+    expect(fx.engine.cancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves a batch transcription to finish, since its audio is already gone', () => {
+    // Batch has no drain: the blob is at the transcriber and its single final is
+    // routed back to the slot that dictated it, so there is nothing to throw away.
+    const { hook, switchTo } = mount(STT_BATCH)
+    fx.engine.recording = false
+    fx.engine.transcribing = true
+    fx.engine.draining = false
+    fx.engine.sessionOwner = SESSION
+    act(() => { hook.rerender() })
+    switchTo('slot-b')
+    expect(fx.engine.cancel).not.toHaveBeenCalled()
+  })
+
+  it('discards a streaming capture the user walks out on, rather than committing it', () => {
+    // The commit path cannot deliver here: the switch disarms the streaming final
+    // one line earlier, so stopping only starts a drain nobody can end — the new
+    // slot does not own the session, so its Escape is inert, and the microphone
+    // stays claimed until the engine's own timeout.
+    const { hook, switchTo } = mount()
+    fx.engine.recording = true
+    fx.engine.transcribing = false
+    fx.engine.draining = false
+    fx.engine.sessionOwner = SESSION
+    act(() => { hook.rerender() })
+    switchTo('slot-b')
+    expect(fx.engine.cancel).toHaveBeenCalledTimes(1)
+    expect(fx.engine.toggle).not.toHaveBeenCalled()
+  })
+
+  it('still commits a batch capture, whose transcript reaches the slot that spoke it', () => {
+    // Batch keeps the pre-existing contract: stop and transcribe. Only streaming,
+    // whose final this switch has already dropped, is discarded.
+    const { hook, switchTo } = mount(STT_BATCH)
+    fx.engine.recording = true
+    fx.engine.transcribing = false
+    fx.engine.draining = false
+    fx.engine.sessionOwner = SESSION
+    act(() => { hook.rerender() })
+    switchTo('slot-b')
+    expect(fx.engine.toggle).toHaveBeenCalledTimes(1)
+    expect(fx.engine.cancel).not.toHaveBeenCalled()
   })
 })

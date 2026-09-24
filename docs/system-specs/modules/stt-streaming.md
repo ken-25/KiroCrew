@@ -132,7 +132,15 @@ window as `draining`, apart from the transcription flag it is folded into, becau
 only a streaming drain still holds the audio a discard can throw away. The discard
 is also the only gesture the window accepts: the microphone button picks its action
 from whether capture is live, so during the drain it would open a second dictation
-rather than end the pending one.
+rather than end the pending one. Switching the composer to another session discards
+a streaming dictation outright, whether capture is still live or the utterance is
+already released: the switch drops the streaming final one step earlier, so a
+commit delivers nothing and a session left running holds the microphone and
+refuses dictation in every slot with no surface able to release it -- the drain's
+exit belongs to the composer that owns the capture. A batch capture is still
+committed by the switch, and a batch transcription already in flight is left to
+finish: one blob reaches the transcriber and its single final is routed back to
+the slot that dictated it.
 Late final corrections preserve text the user types after capture has stopped.
 Every actual capture end, including a fatal server frame, synchronously fires
 the composer's once-only capture-stop protection before deferred socket-close

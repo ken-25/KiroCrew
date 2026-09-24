@@ -783,7 +783,22 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     // applyVoiceText. (Cross-slot streaming delivery is a follow-up; streaming
     // is opt-in and off by default.)
     if (streamEnabledRef.current) sttDisarmedRef.current = true
-    if (voiceRef.current.recording) voiceRef.current.toggle()
+    // Streaming: end the session by DISCARDING it, whether capture is still live
+    // or the utterance is already released and queued behind the recogniser. The
+    // line above has just dropped the final, so a commit delivers nothing — it
+    // only leaves the session draining with the socket, the audio and the
+    // microphone held, and `transcribing` then refuses dictation in EVERY slot
+    // until the engine's own final timeout. Nothing can release it in the
+    // meantime either: the drain's exit is Escape in the composer that owns the
+    // capture, and that composer is no longer the one on screen. The raw hook
+    // cancel, matching the toggle below: this effect has already cleared the
+    // snapshot and disarmed, which is all `cancelVoice` adds, and the partial
+    // this composer now shows belongs to the slot switched TO.
+    if (streamEnabledRef.current && (voiceRef.current.recording || voiceRef.current.draining)) voiceRef.current.cancel()
+    // Batch keeps the commit: its blob is handed to the transcriber whole and its
+    // single final is routed back to the slot that dictated it, so stopping is a
+    // delivery rather than a wait nobody can end.
+    else if (voiceRef.current.recording) voiceRef.current.toggle()
     // A batch transcript that settled while no composer showed its session is
     // held by the inbox; this composer may be that session's now. Delivery is
     // synchronous, so the flag brackets exactly the held delivery.
