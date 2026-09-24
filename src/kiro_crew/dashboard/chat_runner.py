@@ -2067,6 +2067,37 @@ _MAX_SNAPSHOT = 200_000  # cap per-file snapshot to bound message meta size
 # reconstruction declines instead of stalling the loop on a huge file.
 _MAX_RECONSTRUCT_BYTES = 2_000_000
 
+# Chars of path+before+after one TURN's file_changes may carry across every
+# entry EXCEPT its protected one -- the most recent entry whose content differs,
+# which ``_apply_turn_snapshot_budget`` keeps whole and never charges here.
+# ``_MAX_SNAPSHOT`` bounds one file; without a turn bound a single turn that
+# rewrites a dozen large files still attaches megabytes to one message, and
+# every later read of that transcript pays for it. Two per-file caps' worth, so
+# beside the protected entry the budget holds paths and one more large
+# before/after. An entry truncated on BOTH sides exceeds it and is demoted.
+# The most one turn stores is this budget plus the protected entry: at most
+# ``2 * _MAX_SNAPSHOT`` plus two markers and ``_MAX_SNAPSHOT_PATH_CHARS``.
+_MAX_TURN_SNAPSHOT_CHARS = 2 * _MAX_SNAPSHOT
+
+# Chars of PATH one snapshot entry may carry. The path is LLM-supplied and is
+# retained even for an entry whose content the turn budget drops, so without a
+# bound here one tool call naming a megabyte-long path puts that megabyte on the
+# message. The bound sits at the longest path a supported OS can open: Windows
+# with the extended-length prefix (``\\?\``, which ``strip_extended_length_prefix``
+# handles) reaches 32,767 characters, well past Linux's 4,096 and macOS's 1,024,
+# so a longer string cannot name a file anywhere and refusing it loses no real
+# snapshot.
+_MAX_SNAPSHOT_PATH_CHARS = 32_767
+
+# Entries one turn's file_changes may carry. Bounding content and path length
+# still leaves the ROW COUNT open, and a path-only row is not free: without this
+# a turn touching thousands of files puts thousands of rows on one message. Far
+# above any real turn -- the largest observed touched 11 files. The same number
+# bounds the in-turn accumulator (``_turn_snapshots_full``): a write past it is
+# not snapshotted at all, so a turn never holds more before-snapshots in memory
+# than it can store.
+_MAX_TURN_SNAPSHOT_ENTRIES = 200
+
 # Distinct redacted tool_call_ids one turn tracks a source digest for. The ids
 # come from the LLM, so their number is not the runner's to trust; past this a
 # further id is treated as collapsed, which withholds its app notice rather than
@@ -2337,7 +2368,18 @@ def _snapshot_write_target(
         return None
     cmd = raw_params.get("command", "")
     path = raw_params.get("path", "") or diff_path
-    if not path or cmd not in _WRITE_COMMANDS:
+    if (
+        not isinstance(path, str)
+        or not path
+        or not isinstance(cmd, str)
+        or cmd not in _WRITE_COMMANDS
+    ):
+        return None
+    # The path comes from the tool call, so its length is not this function's to
+    # trust: an entry keeps its path even when the turn budget drops its content,
+    # so an unbounded one would ride onto the message no matter what that budget
+    # says. Past _MAX_SNAPSHOT_PATH_CHARS no supported OS can open it anyway.
+    if len(path) > _MAX_SNAPSHOT_PATH_CHARS:
         return None
     # Refuse sensitive paths even before the write executes (the file may not
     # exist yet for `create`, which makes _safe_read_snapshot return None for
@@ -2387,6 +2429,135 @@ def _snapshot_write_target(
     }
 
 
+def _apply_turn_snapshot_budget(
+    entries: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Spend the turn's snapshot budget on its most recent work.
+
+    Charges path+before+after in LAST-WRITE order, newest first, keeping content
+    while the running total fits ``_MAX_TURN_SNAPSHOT_CHARS``. An entry past
+    that point keeps its path and loses its content if the path fits; otherwise
+    the whole entry is dropped. Retained paths are charged even when content is
+    omitted. ``_last_write`` carries that order from the dedupe loop; an entry
+    without it is charged in list order, so a caller
+    that builds entries directly still gets newest-last semantics.
+
+    One entry is protected from the budget: the most recent one whose content
+    actually differs. A protected slot spent on an idempotent write -- a
+    format-on-save whose before equals its after, which this flush deliberately
+    keeps -- would drop the turn's only real diff to store a diff of nothing. The
+    protected entry is kept whole and is NOT charged: the budget governs the
+    other entries, so a turn that edits one large file and one small one keeps
+    both diffs, and a turn always shows the diff for the change that just
+    happened. The stored total is therefore bounded by the budget plus one
+    entry's worst case (two per-file caps, their truncation markers and one
+    path at ``_MAX_SNAPSHOT_PATH_CHARS``), as the constant's comment states.
+
+    Per-entry metadata also costs space, so the character budget leaves the
+    ROW COUNT unbounded. ``_MAX_TURN_SNAPSHOT_ENTRIES`` bounds that separately:
+    past it the oldest entries are dropped rather than kept as paths, so every
+    field this function retains is bounded -- content and paths by the budget,
+    each path by ``_MAX_SNAPSHOT_PATH_CHARS`` at admission, and their number by
+    the cap.
+
+    Returns the entries reordered so the ones that kept their content come
+    first, then how many were demoted and how many dropped. The card renders only
+    its first rows before a "show more" fold, so a reader who opens one turn sees
+    the diffs it kept rather than a screen of notices with the real change folded
+    away.
+    """
+
+    def entry_chars(entry: dict[str, Any]) -> int:
+        return (
+            len(entry.get("path") or "")
+            + len(entry.get("before") or "")
+            + len(entry.get("after") or "")
+        )
+
+    by_recency = sorted(
+        range(len(entries)),
+        key=lambda index: entries[index].get("_last_write", index),
+        reverse=True,
+    )
+    # The protected entry is kept whole and stays outside the budget: charging
+    # it would let one entry at the per-file cap consume the whole budget by
+    # itself and demote a second file of ANY size. It counts toward the row cap.
+    protected_index = next(
+        (i for i in by_recency if entries[i].get("before") != entries[i].get("after")),
+        None,
+    )
+    kept_chars = 0
+    demoted = 0
+    dropped: list[int] = []
+    retained = 1 if protected_index is not None else 0
+    for index in by_recency:
+        if index == protected_index:
+            continue
+        entry = entries[index]
+        path_chars = len(entry.get("path") or "")
+        if (
+            retained >= _MAX_TURN_SNAPSHOT_ENTRIES
+            or kept_chars + path_chars > _MAX_TURN_SNAPSHOT_CHARS
+        ):
+            dropped.append(index)
+            continue
+        retained += 1
+        if kept_chars + entry_chars(entry) <= _MAX_TURN_SNAPSHOT_CHARS:
+            kept_chars += entry_chars(entry)
+            continue
+        entry.update(
+            before="",
+            after="",
+            truncated=True,
+            content_omitted=True,
+            turn_budget_chars=_MAX_TURN_SNAPSHOT_CHARS,
+        )
+        entry.pop("snapshot_limit_chars", None)
+        kept_chars += path_chars
+        demoted += 1
+    for entry in entries:
+        entry.pop("_last_write", None)
+    survivors = [e for i, e in enumerate(entries) if i not in set(dropped)]
+    ordered = [e for e in survivors if not e.get("content_omitted")]
+    ordered += [e for e in survivors if e.get("content_omitted")]
+    return ordered, demoted, len(dropped)
+
+
+def _turn_snapshots_full(slot: "_ChatSlot") -> bool:
+    """Whether this turn's before-snapshot accumulator has reached its bound.
+
+    ``_apply_turn_snapshot_budget`` retains at most ``_MAX_TURN_SNAPSHOT_ENTRIES``
+    rows, but it runs at flush, after the turn ends, so a bound applied only
+    there lets a turn that writes very many files hold every snapshot -- each up
+    to the per-file cap -- in memory until then. The same number applied here,
+    before a snapshot is read, bounds the accumulator by the rule that bounds
+    what is stored. It counts WRITES, not distinct paths: a re-edit of a known
+    path is a raw entry of its own, so counting paths would leave the list
+    unbounded. A turn past the bound forfeits snapshots for its later writes --
+    a new path gains no row, a known path keeps its first before and its after
+    is read from disk at flush as usual -- which is far above any real turn.
+    """
+    changes = getattr(slot, "_file_changes", None)
+    return isinstance(changes, list) and len(changes) >= _MAX_TURN_SNAPSHOT_ENTRIES
+
+
+def _record_turn_snapshot(slot: "_ChatSlot", snapshot: dict[str, Any]) -> None:
+    """Append one before-snapshot; say so once when the accumulator fills.
+
+    The bound is enforced by ``_turn_snapshots_full`` at the call sites; this
+    logs on the append that reaches it, which happens once per turn, so a turn
+    whose later writes go unsnapshotted leaves a trace rather than a silent gap.
+    """
+    slot._file_changes.append(snapshot)
+    if len(slot._file_changes) == _MAX_TURN_SNAPSHOT_ENTRIES:
+        logger.warning(
+            "Slot %s reached %d file-change snapshots this turn; "
+            "further writes this turn are not snapshotted",
+            slot.key,
+            _MAX_TURN_SNAPSHOT_ENTRIES,
+        )
+
+
 def _flush_file_changes(slot: "_ChatSlot") -> None:
     """Attach accumulated file changes to the last assistant message.
 
@@ -2406,7 +2577,7 @@ def _flush_file_changes(slot: "_ChatSlot") -> None:
     # Dedup: keep first before for each path (truest "before") since a file
     # may be modified multiple times in one turn.
     deduped: dict[str, dict[str, Any]] = {}
-    for fc in slot._file_changes:
+    for write_order, fc in enumerate(slot._file_changes):
         p = fc["path"]
         if p not in deduped:
             deduped[p] = {
@@ -2415,6 +2586,11 @@ def _flush_file_changes(slot: "_ChatSlot") -> None:
                 "after": "",
                 "_before_truncated": bool(fc.get("truncated", False)),
             }
+        # The FIRST before is the truest one, so the entry keeps it -- but the
+        # turn's budget spends on its most RECENT work, and a file edited early
+        # and again late is recent. Dedupe order cannot say that, so record the
+        # last write per path here, where every write is still visible.
+        deduped[p]["_last_write"] = write_order
     # Read after-content once per path. Uses _safe_read_snapshot so sensitive
     # paths and unreadable files yield empty after rather than crashing or
     # leaking credentials.
@@ -2451,6 +2627,9 @@ def _flush_file_changes(slot: "_ChatSlot") -> None:
     # would silently discard real changes past the snapshot limit or inside
     # redacted spans.
     fc_list = list(deduped.values())
+    # Bound the whole turn AFTER redaction, so the budget measures the content
+    # that actually gets stored rather than the pre-redaction size.
+    fc_list, _demoted, _dropped = _apply_turn_snapshot_budget(fc_list)
     # Attach to the most recent assistant message; if none exists (turn
     # aborted before any text), create a synthetic message so the chips
     # still surface.
@@ -2471,7 +2650,15 @@ def _flush_file_changes(slot: "_ChatSlot") -> None:
             broadcast=False,
             meta={"file_changes": fc_list},
         )
-    logger.info("Attached %d file_changes to slot %s", len(fc_list), slot.key)
+    logger.info(
+        "Attached %d file_changes to slot %s "
+        "(%d path-only, %d dropped, over the %d-char turn budget)",
+        len(fc_list),
+        slot.key,
+        _demoted,
+        _dropped,
+        _MAX_TURN_SNAPSHOT_CHARS,
+    )
     # Honour the in-place-mutation contract (see resolve_permission_message in
     # state.py): "the periodic flush skips non-dirty slots, so an unflagged
     # in-place mutation can be lost on restart". The assistant-message branch
@@ -12262,14 +12449,17 @@ async def _run_chat(
                 # (authoritative) over a disk read which races with the write.
                 # Offloaded: strReplace reconstruction reads the file from
                 # disk, and a slow/hung filesystem must not stall the loop.
-                _file_snapshot = await asyncio.to_thread(
-                    _snapshot_write_target,
-                    event.raw_tool_params,
-                    diff_old_text=event.diff_old_text,
-                    diff_path=event.diff_path,
-                )
-                if _file_snapshot:
-                    slot._file_changes.append(_file_snapshot)
+                # Skipped entirely once the accumulator is full: a snapshot the
+                # flush cannot retain is not worth reading or holding.
+                if not _turn_snapshots_full(slot):
+                    _file_snapshot = await asyncio.to_thread(
+                        _snapshot_write_target,
+                        event.raw_tool_params,
+                        diff_old_text=event.diff_old_text,
+                        diff_path=event.diff_path,
+                    )
+                    if _file_snapshot:
+                        _record_turn_snapshot(slot, _file_snapshot)
                 state.broadcast_ws(
                     "tool_call",
                     _tool_payload,
@@ -12474,15 +12664,17 @@ async def _run_chat(
                     # Prefer the in-band diff_old_text from the ACP content
                     # block (authoritative) over a disk read which races with
                     # the write. Offloaded: reconstruction reads from disk and
-                    # a slow/hung filesystem must not stall the loop.
-                    _file_snapshot_upd = await asyncio.to_thread(
-                        _snapshot_write_target,
-                        event.raw_tool_params,
-                        diff_old_text=event.diff_old_text,
-                        diff_path=event.diff_path,
-                    )
-                    if _file_snapshot_upd:
-                        slot._file_changes.append(_file_snapshot_upd)
+                    # a slow/hung filesystem must not stall the loop. Skipped
+                    # once the accumulator is full, as at the first site.
+                    if not _turn_snapshots_full(slot):
+                        _file_snapshot_upd = await asyncio.to_thread(
+                            _snapshot_write_target,
+                            event.raw_tool_params,
+                            diff_old_text=event.diff_old_text,
+                            diff_path=event.diff_path,
+                        )
+                        if _file_snapshot_upd:
+                            _record_turn_snapshot(slot, _file_snapshot_upd)
                     # Refresh the toolLog entry (sseToolActivity merges by id).
                     state.broadcast_ws(
                         "tool_call",

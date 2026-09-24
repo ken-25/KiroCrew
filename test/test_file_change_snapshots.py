@@ -27,10 +27,16 @@ from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 from conftest import requires_symlinks
 from kiro_crew.dashboard.chat_runner import (
     _MAX_SNAPSHOT,
+    _MAX_SNAPSHOT_PATH_CHARS,
+    _MAX_TURN_SNAPSHOT_CHARS,
+    _MAX_TURN_SNAPSHOT_ENTRIES,
+    _apply_turn_snapshot_budget,
     _flush_file_changes,
+    _record_turn_snapshot,
     _safe_read_snapshot,
     _snapshot_write_target,
     _truncate_snapshot,
+    _turn_snapshots_full,
 )
 from kiro_crew.dashboard.state import _ChatSlot
 
@@ -235,6 +241,24 @@ class TestSnapshotWriteTarget:
 
     def test_returns_none_for_empty_path(self):
         assert _snapshot_write_target({"command": "create", "path": ""}) is None
+
+    @pytest.mark.parametrize(
+        "path",
+        [1, True, ["file.py"], {"path": "file.py"}],
+        ids=["integer", "boolean", "list", "dict"],
+    )
+    def test_returns_none_for_non_string_path(self, path):
+        assert _snapshot_write_target({"command": "create", "path": path}) is None
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [["npm", "test"], {"a": 1}, None, 1],
+        ids=["list", "dict", "none", "integer"],
+    )
+    def test_returns_none_for_non_string_command(self, cmd):
+        # ``command`` rides in off the wire unvalidated; a non-string value,
+        # hashable or not, yields None rather than raising.
+        assert _snapshot_write_target({"command": cmd, "path": "/repo/x.txt"}) is None
 
     def test_returns_none_for_sensitive_path(self):
         # validate_file_path rejects ~/.aws/credentials → no snapshot taken.
@@ -987,3 +1011,379 @@ class TestContentBlockRedactionAndTruncation:
         # If redact_exfiltration_urls masks the URL, it should differ from raw
         # The entry should still exist (before != after)
         assert "file_changes" in meta
+
+
+# ── per-turn snapshot budget ────────────────────────────────────────────────
+
+
+def _entry(path: str, chars: int, *, last_write: int | None = None) -> dict[str, object]:
+    """One entry whose before+after spans ``chars`` and whose two sides differ."""
+    body = chars
+    half = body // 2
+    entry: dict[str, object] = {
+        "path": path,
+        "before": "b" * half,
+        "after": "a" * (body - half),
+    }
+    if last_write is not None:
+        entry["_last_write"] = last_write
+    return entry
+
+
+def _noop_entry(path: str, chars: int, *, last_write: int | None = None) -> dict[str, object]:
+    """An entry whose write changed nothing -- the format-on-save shape."""
+    same = "s" * (chars // 2)
+    entry: dict[str, object] = {"path": path, "before": same, "after": same}
+    if last_write is not None:
+        entry["_last_write"] = last_write
+    return entry
+
+
+# One snapshot side at its largest: the per-file cap plus its truncation marker.
+_SIDE_AT_THE_CAP = _truncate_snapshot("x" * (_MAX_SNAPSHOT + 1)).content
+# One entry at its worst case -- both sides at the cap -- which is what a file
+# over the per-file cap on both sides stores. It exceeds the turn budget by its
+# two markers, so as a NON-protected entry it is always demoted.
+_MAXED_ENTRY_CHARS = 2 * len(_SIDE_AT_THE_CAP)
+
+
+class TestTurnSnapshotBudget:
+    @pytest.mark.parametrize("with_protected", [False, True])
+    def test_path_only_rows_share_the_aggregate_budget(self, with_protected) -> None:
+        paths = [
+            f"/{i:03d}/" + "p" * (_MAX_SNAPSHOT_PATH_CHARS - 5)
+            for i in range(_MAX_TURN_SNAPSHOT_ENTRIES)
+        ]
+        entries = [_entry(path, 0) for path in paths]
+        if with_protected:
+            entries.append(_entry("protected.py", _MAXED_ENTRY_CHARS))
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        charged = [e for e in ordered if e["path"] != "protected.py"]
+        fits = _MAX_TURN_SNAPSHOT_CHARS // _MAX_SNAPSHOT_PATH_CHARS
+        assert [e["path"] for e in charged] == paths[-fits:]
+        assert sum(len(e["path"]) for e in charged) <= _MAX_TURN_SNAPSHOT_CHARS
+        assert (demoted, dropped) == (0, len(paths) - fits)
+        if with_protected:
+            protected = next(e for e in ordered if e["path"] == "protected.py")
+            assert len(protected["before"]) + len(protected["after"]) == _MAXED_ENTRY_CHARS
+
+    def test_demoted_paths_consume_the_aggregate_budget(self) -> None:
+        paths = [
+            f"/{i:03d}/" + "p" * (_MAX_SNAPSHOT_PATH_CHARS - 5)
+            for i in range(_MAX_TURN_SNAPSHOT_ENTRIES)
+        ]
+        entries = [_entry(path, _MAXED_ENTRY_CHARS) for path in paths]
+        entries.append(_entry("protected.py", 2))
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        charged = [e for e in ordered if e.get("content_omitted")]
+        fits = _MAX_TURN_SNAPSHOT_CHARS // _MAX_SNAPSHOT_PATH_CHARS
+        assert [e["path"] for e in charged] == paths[-fits:]
+        assert (demoted, dropped) == (fits, len(paths) - fits)
+        assert all(e["before"] == e["after"] == "" for e in charged)
+        assert sum(len(e["path"]) for e in charged) <= _MAX_TURN_SNAPSHOT_CHARS
+
+    def test_path_and_content_exactly_fill_the_budget(self) -> None:
+        entries = [
+            _entry("old.py", 0),
+            _entry("fits.py", _MAX_TURN_SNAPSHOT_CHARS - len("fits.py")),
+            _entry("protected.py", 2),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert [e["path"] for e in ordered] == ["fits.py", "protected.py"]
+        assert (demoted, dropped) == (0, 1)
+        assert sum(len(ordered[0][key]) for key in ("path", "before", "after")) == (
+            _MAX_TURN_SNAPSHOT_CHARS
+        )
+
+    def test_under_budget_keeps_every_entry_untouched(self) -> None:
+        entries = [_entry("a.py", 100), _entry("b.py", 100)]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert demoted == 0
+        assert [e["path"] for e in ordered] == ["a.py", "b.py"]
+        assert all(e["before"] and e["after"] for e in ordered)
+        assert all("content_omitted" not in e for e in ordered)
+
+    def test_oldest_entries_lose_content_and_newest_keeps_it(self) -> None:
+        # Three files at the worst case: the newest is protected and each of the
+        # others alone exceeds the budget, so only the newest keeps its diff.
+        entries = [
+            _entry("oldest.py", _MAXED_ENTRY_CHARS),
+            _entry("middle.py", _MAXED_ENTRY_CHARS),
+            _entry("newest.py", _MAXED_ENTRY_CHARS),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert demoted == 2
+        # The kept diff sorts first, so it lands inside the card's visible rows.
+        assert [e["path"] for e in ordered] == ["newest.py", "oldest.py", "middle.py"]
+        assert ordered[0]["before"] and ordered[0]["after"]
+        for entry in ordered[1:]:
+            assert entry["before"] == ""
+            assert entry["after"] == ""
+            assert entry["truncated"] is True
+            assert entry["content_omitted"] is True
+            assert entry["turn_budget_chars"] == _MAX_TURN_SNAPSHOT_CHARS
+
+    def test_budget_follows_the_last_write_not_the_first(self) -> None:
+        # The turn edits early.py, then late.py, then early.py again. Dedupe
+        # order puts early.py first, but it is the file the turn touched last.
+        entries = [
+            _entry("early.py", _MAXED_ENTRY_CHARS, last_write=2),
+            _entry("late.py", _MAXED_ENTRY_CHARS, last_write=1),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert demoted == 1
+        assert ordered[0]["path"] == "early.py"
+        assert ordered[0]["before"] and ordered[0]["after"]
+        assert ordered[1]["path"] == "late.py"
+        assert ordered[1]["content_omitted"] is True
+
+    def test_an_idempotent_final_write_does_not_spend_the_protected_slot(self) -> None:
+        # A format-on-save that changed nothing is the most recent entry; the
+        # real change must keep its diff rather than fund a diff of nothing.
+        entries = [
+            _entry("real.py", _MAXED_ENTRY_CHARS, last_write=0),
+            _noop_entry("formatted.py", _MAXED_ENTRY_CHARS, last_write=1),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert demoted == 1
+        kept = next(e for e in ordered if not e.get("content_omitted"))
+        assert kept["path"] == "real.py"
+        assert kept["before"] and kept["after"]
+
+    def test_newest_entry_survives_even_when_it_alone_exceeds_the_budget(self) -> None:
+        # The protected entry is outside the budget, so its size neither drops
+        # it nor charges the small older file, which keeps its diff too.
+        entries = [_entry("old.py", 10), _entry("huge.py", _MAX_TURN_SNAPSHOT_CHARS + 1)]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert (demoted, dropped) == (0, 0)
+        assert [e["path"] for e in ordered] == ["old.py", "huge.py"]
+        assert all(e["before"] and e["after"] for e in ordered)
+
+    def test_total_kept_content_stays_within_the_budget_plus_one_entry(self) -> None:
+        # The protected entry is outside the budget, so the stored total is
+        # bounded by the budget plus one entry at its worst case, never more.
+        entries = [_entry(f"f{i}.py", 150_000) for i in range(12)]
+        ordered, _demoted, _dropped = _apply_turn_snapshot_budget(entries)
+        kept = sum(len(e["before"]) + len(e["after"]) for e in ordered)
+        assert kept <= _MAX_TURN_SNAPSHOT_CHARS + _MAXED_ENTRY_CHARS
+        assert kept > _MAX_TURN_SNAPSHOT_CHARS
+
+    def test_a_noop_entry_cannot_push_the_kept_total_past_the_bound(self) -> None:
+        # The no-op is not protected, so it is charged; the real diff is kept
+        # outside the budget. Neither can exceed the budget-plus-one-entry bound.
+        entries = [
+            _entry("real.py", _MAXED_ENTRY_CHARS, last_write=0),
+            _noop_entry("formatted.py", _MAXED_ENTRY_CHARS, last_write=1),
+        ]
+        ordered, _demoted, _dropped = _apply_turn_snapshot_budget(entries)
+        kept = sum(len(e["before"]) + len(e["after"]) for e in ordered)
+        assert kept <= _MAX_TURN_SNAPSHOT_CHARS + _MAXED_ENTRY_CHARS
+
+    def test_a_maxed_protected_entry_does_not_demote_a_small_second_file(self) -> None:
+        # The turn edits a file at the per-file cap on both sides and then a
+        # two-character file. The protected entry is not charged, so the small
+        # diff fits the budget and both are kept.
+        side = _SIDE_AT_THE_CAP
+        entries = [
+            {"path": "small.py", "before": "x", "after": "y", "_last_write": 0},
+            {"path": "big.py", "before": "b" + side[1:], "after": side, "_last_write": 1},
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert (demoted, dropped) == (0, 0)
+        assert [e["path"] for e in ordered] == ["small.py", "big.py"]
+        assert all(e["before"] and e["after"] for e in ordered)
+
+    def test_the_budget_holds_one_more_large_entry_beside_the_protected_one(self) -> None:
+        # Two maxed files where the older one is at the cap on one side only:
+        # it fits the two-cap budget and keeps its diff beside the protected
+        # entry, so a turn rewriting two large files shows both.
+        side = _SIDE_AT_THE_CAP
+        entries = [
+            {"path": "older.py", "before": side, "after": "a" * (_MAX_SNAPSHOT - 100)},
+            {"path": "newest.py", "before": side, "after": "z" + side[1:]},
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert (demoted, dropped) == (0, 0)
+        assert [e["path"] for e in ordered] == ["older.py", "newest.py"]
+
+    def test_a_turn_of_only_noop_writes_keeps_what_fits_and_demotes_the_rest(self) -> None:
+        # Nothing has a real diff, so nothing is protected; the budget alone
+        # decides, and the no-change captions that fit are kept.
+        entries = [
+            _noop_entry("a.py", _MAX_TURN_SNAPSHOT_CHARS - len("a.pyb.py"), last_write=0),
+            _noop_entry("b.py", _MAX_TURN_SNAPSHOT_CHARS - len("a.pyb.py"), last_write=1),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert demoted == 1
+        assert ordered[0]["path"] == "b.py"
+        assert ordered[0]["before"] == ordered[0]["after"] != ""
+
+    def test_a_demoted_entry_drops_the_per_file_limit_field(self) -> None:
+        # A file both individually truncated AND demoted reports one reason:
+        # the turn budget, because its content is gone for that reason.
+        entries = [
+            {
+                "path": "old.py",
+                "before": "b" + _SIDE_AT_THE_CAP[1:],
+                "after": _SIDE_AT_THE_CAP,
+                "truncated": True,
+                "snapshot_limit_chars": _MAX_SNAPSHOT,
+            },
+            _entry("newest.py", _MAXED_ENTRY_CHARS),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert demoted == 1
+        dropped = next(e for e in ordered if e.get("content_omitted"))
+        assert dropped["path"] == "old.py"
+        assert "snapshot_limit_chars" not in dropped
+
+    def test_the_internal_write_order_key_never_reaches_a_stored_entry(self) -> None:
+        entries = [_entry("a.py", 10, last_write=0), _entry("b.py", 10, last_write=1)]
+        ordered, _demoted, _dropped = _apply_turn_snapshot_budget(entries)
+        assert all("_last_write" not in e for e in ordered)
+
+    def test_the_row_count_is_bounded_even_when_every_row_is_path_only(self) -> None:
+        # A path-only row is not free, so the content budget alone would leave
+        # the number of retained rows open.
+        entries = [
+            _entry(f"/f{i}.py", _MAXED_ENTRY_CHARS, last_write=i)
+            for i in range(_MAX_TURN_SNAPSHOT_ENTRIES + 25)
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert len(ordered) == _MAX_TURN_SNAPSHOT_ENTRIES
+        assert dropped == 25
+        assert demoted == _MAX_TURN_SNAPSHOT_ENTRIES - 1
+
+    def test_the_rows_dropped_for_the_count_are_the_oldest(self) -> None:
+        entries = [
+            _entry(f"/f{i}.py", 10, last_write=i) for i in range(_MAX_TURN_SNAPSHOT_ENTRIES + 3)
+        ]
+        ordered, _demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert dropped == 3
+        kept_paths = {e["path"] for e in ordered}
+        assert {"/f0.py", "/f1.py", "/f2.py"}.isdisjoint(kept_paths)
+
+    def test_a_turn_within_the_count_keeps_a_path_for_every_file(self) -> None:
+        # The older entry alone exceeds the content budget; it must still keep
+        # its path rather than vanish from the card.
+        entries = [
+            _entry("/old.py", _MAXED_ENTRY_CHARS, last_write=0),
+            _entry("/protected.py", _MAXED_ENTRY_CHARS, last_write=1),
+        ]
+        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
+        assert (demoted, dropped) == (1, 0)
+        assert [e["path"] for e in ordered] == ["/protected.py", "/old.py"]
+
+    def test_flush_records_paths_for_the_files_it_demotes(self, short_tmp_dir: Path) -> None:
+        paths = []
+        for index in range(3):
+            target = short_tmp_dir / f"f{index}.txt"
+            target.write_text("a" * _MAX_TURN_SNAPSHOT_CHARS)
+            paths.append(target)
+        slot = _make_slot_with_assistant_message()
+        slot._file_changes = [
+            {"path": str(p), "content": "b" * _MAX_TURN_SNAPSHOT_CHARS} for p in paths
+        ]
+        _flush_file_changes(slot)
+        changes = slot.messages[-1]["meta"]["file_changes"]
+        # Every file keeps a path; the last-written one keeps its diff and leads.
+        assert {c["path"] for c in changes} == {str(p) for p in paths}
+        assert changes[0]["path"] == str(paths[-1])
+        assert [bool(c.get("content_omitted")) for c in changes] == [False, True, True]
+        assert all("_last_write" not in c for c in changes)
+
+    def test_flush_charges_the_budget_to_the_files_written_last(self, short_tmp_dir: Path) -> None:
+        early = short_tmp_dir / "early.txt"
+        late = short_tmp_dir / "late.txt"
+        for target in (early, late):
+            target.write_text("a" * _MAX_TURN_SNAPSHOT_CHARS)
+        slot = _make_slot_with_assistant_message()
+        # early is written, then late, then early again.
+        slot._file_changes = [
+            {"path": str(early), "content": "b" * _MAX_TURN_SNAPSHOT_CHARS},
+            {"path": str(late), "content": "b" * _MAX_TURN_SNAPSHOT_CHARS},
+            {"path": str(early), "content": "ignored second before"},
+        ]
+        _flush_file_changes(slot)
+        changes = slot.messages[-1]["meta"]["file_changes"]
+        kept = next(c for c in changes if not c.get("content_omitted"))
+        assert kept["path"] == str(early)
+        # The first before is still the one stored, not the second write's.
+        assert kept["before"].startswith("b")
+
+
+class TestSnapshotPathBound:
+    def test_the_bound_is_the_windows_extended_length_ceiling(self) -> None:
+        # Windows native is a supported platform, and with the extended-length
+        # prefix a path reaches 32,767 characters; a lower bound refuses a
+        # snapshot for a file the OS can open.
+        assert _MAX_SNAPSHOT_PATH_CHARS == 32_767
+
+    def test_a_path_no_os_can_open_is_refused_at_admission(self) -> None:
+        # The path is LLM-supplied; an entry keeps it even when its content is
+        # dropped, so an unbounded one would ride onto the message regardless.
+        long_path = "/tmp/" + "a" * (_MAX_SNAPSHOT_PATH_CHARS + 1) + ".txt"
+        assert (
+            _snapshot_write_target({"command": "create", "path": long_path}, diff_old_text="")
+            is None
+        )
+
+    def test_a_windows_long_path_within_the_ceiling_is_admitted(self) -> None:
+        # Longer than any Linux pathname, shorter than the Windows ceiling: the
+        # length check lets it through to the path validator. The validator
+        # itself decides on the path's content, not its length, so the test
+        # confirms the length gate alone did not refuse it.
+        long_path = "\\\\?\\C:\\" + "a" * 8_000 + "\\file.txt"
+        assert 4_096 < len(long_path) <= _MAX_SNAPSHOT_PATH_CHARS
+        with patch("kiro_crew.dashboard.chat_runner.validate_file_path") as validate:
+            validate.return_value = None
+            assert (
+                _snapshot_write_target({"command": "create", "path": long_path}, diff_old_text="")
+                is None
+            )
+            validate.assert_called_once_with(long_path)
+
+    def test_a_path_at_the_bound_is_still_captured(self, tmp_path: Path) -> None:
+        target = tmp_path / "small.txt"
+        target.write_text("after")
+        assert len(str(target)) <= _MAX_SNAPSHOT_PATH_CHARS
+        captured = _snapshot_write_target(
+            {"command": "create", "path": str(target)}, diff_old_text="before"
+        )
+        assert captured is not None
+        assert captured["path"] == str(target)
+
+
+class TestTurnSnapshotAccumulator:
+    def test_the_accumulator_stops_growing_at_the_row_cap(self) -> None:
+        slot = MagicMock()
+        slot.key = "chat-1"
+        slot._file_changes = []
+        for index in range(_MAX_TURN_SNAPSHOT_ENTRIES + 10):
+            if not _turn_snapshots_full(slot):
+                _record_turn_snapshot(slot, {"path": f"/f{index}.py", "content": "b"})
+        assert len(slot._file_changes) == _MAX_TURN_SNAPSHOT_ENTRIES
+        assert _turn_snapshots_full(slot)
+
+    def test_the_accumulator_admits_every_write_below_the_cap(self) -> None:
+        slot = MagicMock()
+        slot._file_changes = [{"path": "/a.py", "content": ""}] * (_MAX_TURN_SNAPSHOT_ENTRIES - 1)
+        assert not _turn_snapshots_full(slot)
+
+    def test_a_slot_without_a_real_list_is_not_full(self) -> None:
+        # A MagicMock attribute is not an accumulator; the flush already treats
+        # it as no changes, and the admission side agrees.
+        assert not _turn_snapshots_full(MagicMock())
+
+    def test_reaching_the_cap_is_logged_once(self, caplog: pytest.LogCaptureFixture) -> None:
+        slot = MagicMock()
+        slot.key = "chat-1"
+        slot._file_changes = [{"path": "/a.py", "content": ""}] * (_MAX_TURN_SNAPSHOT_ENTRIES - 2)
+        with caplog.at_level("WARNING", logger="kiro_crew.dashboard.chat_runner"):
+            _record_turn_snapshot(slot, {"path": "/b.py", "content": ""})
+            assert not caplog.records
+            _record_turn_snapshot(slot, {"path": "/c.py", "content": ""})
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Slot chat-1 reached {_MAX_TURN_SNAPSHOT_ENTRIES} file-change snapshots "
+            "this turn; further writes this turn are not snapshotted"
+        ]
