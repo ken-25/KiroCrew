@@ -313,11 +313,13 @@ def test_every_tier_routes_all_eight_mounts_through_the_guard() -> None:
             if "_libc.mount(" in line and "source, target, None, flags, None" not in line
         ]
         assert raw == [], f"{level}: unchecked mount call(s): {raw}"
-        # 1 def + 8 call sites: propagation, credential dirs, the read-only
-        # bind and its sealing remount, sensitive files, ~/.ssh, and the private
+        # 1 def + 9 call sites: propagation, credential dirs, the read-only
+        # bind and its sealing remount, sensitive files, ~/.ssh, the private
         # window's two -- staging its real contents out before the parent is
-        # masked, then binding them onto the placeholder inside the stand-in.
-        assert script.count("_mount_or_die(") == 9
+        # masked, then binding them onto the placeholder inside the stand-in --
+        # and the nested re-mask that re-hides a masked leaf sitting INSIDE such
+        # a window, applied after the window is bound.
+        assert script.count("_mount_or_die(") == 10
 
 
 # --------------------------------------------------------------------------
