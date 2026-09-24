@@ -366,17 +366,18 @@ def test_client_capabilities_are_the_shared_constants():
     assert harness_for(ACP_BACKEND_KAS).client_capabilities == KAS_CLIENT_CAPABILITIES
 
 
-def test_kas_capabilities_open_only_the_settings_channel():
-    """KAS's extra capability is the settings channel and nothing else.
+def test_kas_capabilities_open_only_the_settings_and_hooks_channels():
+    """KAS's extra capabilities are the settings channel and hooks, nothing else.
 
     Every other ``_meta.kiro`` capability is a callback Crew does not implement,
-    so declaring one would invite a request with no handler. The channel is
-    declared EMPTY here: the runtime fills it at spawn from the operator's
-    settings (``client_meta_settings``), so the constant stays the pristine shape
-    every host's handshake is compared against.
+    so declaring one would invite a request with no handler. Hooks is declared
+    because ``acp/kas_wire.py`` serves all three of its methods. The settings
+    channel is declared EMPTY here: the runtime fills it at spawn from the
+    operator's settings (``client_meta_settings``), so the constant stays the
+    pristine shape every host's handshake is compared against.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
-    assert kas["_meta"] == {"kiro": {"settings": {}}}
+    assert kas["_meta"] == {"kiro": {"settings": {}, "hooks": {"enabled": True}}}
     assert {k: v for k, v in kas.items() if k != "_meta"} == ACP_CLIENT_CAPABILITIES
 
 

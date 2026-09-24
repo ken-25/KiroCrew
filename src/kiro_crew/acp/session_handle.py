@@ -171,11 +171,17 @@ from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
 
 logger = logging.getLogger(__name__)
 
-#: The backend's read-only hooks requests, answered by
+#: The backend's hooks requests, answered by
 #: :meth:`AcpSessionHandle._answer_kas_hooks_request`. A frozenset so the
-#: dispatch test is one membership check rather than two comparisons, and so
-#: the executable third method of that surface is visibly absent from it.
-_KAS_HOOKS_METHODS = frozenset({kas_wire.METHOD_HOOKS_LIST, kas_wire.METHOD_HOOKS_SESSION_START})
+#: dispatch test is one membership check. ``executeHook`` is the one that runs a
+#: command, and :func:`kas_wire.hooks_execute` owns every gate it passes.
+_KAS_HOOKS_METHODS = frozenset(
+    {
+        kas_wire.METHOD_HOOKS_LIST,
+        kas_wire.METHOD_HOOKS_SESSION_START,
+        kas_wire.METHOD_HOOKS_EXECUTE,
+    }
+)
 
 # ── Constants ──
 
@@ -814,8 +820,20 @@ class AcpSessionHandle:
         runtime: AcpRuntimeProtocol,
         watchdog: WatchdogSettings | None = None,
         crew_agent: str = "",
+        session_key: str = "",
     ) -> None:
         self._session_id = session_id
+        # The Kiro Crew session that OWNS this ACP session, threaded from the
+        # runtime's create/load paths the way ``crew_agent`` is, and rebound on a
+        # warm-pool claim. The hooks execute path keys its listed-id record and
+        # its governance resolution by it; the ACP ``sessionId`` a request names is
+        # host-supplied and is never used for either. Empty for a pooled session
+        # nobody has claimed yet, which the execute path refuses.
+        self._session_key = session_key
+        self._listed_hooks = kas_wire.ListedHookStore()
+        # Strong references to in-flight hook executions: the loop holds only a
+        # weak one, and a collected task would leave its request unanswered.
+        self._hook_tasks: set[asyncio.Task[None]] = set()
         self.native_context_documents: dict[str, str] = {}
         self._queue = queue
         self._runtime = runtime
@@ -2751,6 +2769,14 @@ class AcpSessionHandle:
         self._watchdog = settings if settings is not None else _load_watchdog_settings(crew_agent)
         self._oracle._sample_min_secs = self._watchdog.wellness_sample_secs
 
+    def bind_session_key(self, session_key: str) -> None:
+        """Rebind the owning Kiro Crew session on a warm-pool claim.
+
+        The listed-hook record is keyed by that session, so ids listed before the
+        claim stay under the previous key and are unreachable from the new one.
+        """
+        self._session_key = session_key
+
     def store_session_config(self, resp: dict[str, Any]) -> None:
         """Extract configOptions and available models from session/new or session/load response.
 
@@ -3644,7 +3670,7 @@ class AcpSessionHandle:
                         logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
                     continue
 
-                # The backend's two READ-ONLY hooks requests, answered here rather
+                # The backend's hooks requests, answered here rather
                 # than through the shared classifier: that classifier is also read
                 # by the single-session client, which serves no hooks surface, and
                 # naming an action there that only this loop handles would leave
@@ -4574,8 +4600,8 @@ class AcpSessionHandle:
         defined the channel.
 
         Four conditions, all required: the frame is a request (it carries an id and
-        so needs a response), its method is a string, that string is one of the two
-        read-only ones, and this session's backend is in the capability set. The
+        so needs a response), its method is a string, that string is one of the
+        hooks methods, and this session's backend is in the capability set. The
         type check is load-bearing, not defensive: ``method`` carries whatever the
         peer put on the wire, and a JSON list or object there makes the membership
         test raise :class:`TypeError` inside the dispatch loop.
@@ -4588,29 +4614,67 @@ class AcpSessionHandle:
         )
 
     async def _answer_kas_hooks_request(self, msg: JsonRpcMessage) -> None:
-        """Answer one read-only hooks request from the backend.
+        """Answer one hooks request from the backend.
 
-        Both answers are built in :mod:`kiro_crew.acp.kas_wire`, which owns the
-        shapes; this is the route that carries them. Neither runs a command: the
-        method that would is not served at all, so it arrives as an unknown
-        server request and is refused.
+        The answers are built in :mod:`kiro_crew.acp.kas_wire`, which owns the
+        shapes; this is the route that carries them.
 
-        Both answers stay on this loop. Each reads an in-memory dict and nothing
-        else -- no file, no socket, no governance resolution -- so a thread hop
-        would buy nothing on the loop that demuxes every multiplexed session's
-        frames.
+        ``list`` and ``sessionStart`` stay on this loop: each reads an in-memory
+        dict and nothing else, so a thread hop would buy nothing. ``list`` records
+        what it answered under this handle's OWNING session, which is the record
+        ``executeHook`` checks.
 
-        Nothing about the answer is remembered. An execute path may only run an id
-        this surface listed for the session that asks, and the record that answers
-        that belongs with the execute path, keyed by the owning Kiro Crew session
-        this handle does not hold.
+        ``executeHook`` runs as a task of its own. It waits on a subprocess for up
+        to the hook's timeout, and this loop demuxes every frame of the turn --
+        including the cancel that would end it.
         """
         params = msg.params if isinstance(msg.params, dict) else {}
+        if msg.method == kas_wire.METHOD_HOOKS_EXECUTE:
+            task = asyncio.create_task(self._answer_kas_hook_execute(msg.id, params))
+            self._hook_tasks.add(task)
+            task.add_done_callback(self._hook_tasks.discard)
+            return
         if msg.method == kas_wire.METHOD_HOOKS_LIST:
-            result = kas_wire.hooks_list_response(params)
+            result = kas_wire.hooks_list_response(
+                params, session_key=self._session_key, listed=self._listed_hooks
+            )
         else:
             result = kas_wire.hooks_session_start_response(params)
         await self._runtime.send_response(msg.id, result)
+
+    async def _answer_kas_hook_execute(self, request_id: Any, params: dict) -> None:
+        """Run one listed hook and answer the request, refusal included.
+
+        A refusal is answered as a JSON-RPC error carrying its reason, never as a
+        result: a result carries an exit code, and a command that never started has
+        none. An unexpected failure is answered the same way, so the backend's turn
+        is never left waiting on a request nobody will answer.
+        """
+        try:
+            result = await kas_wire.hooks_execute(
+                params,
+                session_key=self._session_key,
+                agent=self._crew_agent,
+                listed=self._listed_hooks,
+            )
+        except kas_wire.HookExecuteRefused as exc:
+            logger.info("KAS executeHook refused for %s: %s", self._session_id, exc)
+            await self._send_hook_error(request_id, f"Refused by Kiro Crew: {exc}")
+            return
+        except Exception:
+            logger.exception("KAS executeHook failed for %s", self._session_id)
+            await self._send_hook_error(request_id, "Kiro Crew could not run the hook")
+            return
+        try:
+            await self._runtime.send_response(request_id, result)
+        except Exception:
+            logger.warning("KAS executeHook answer undeliverable for %s", self._session_id)
+
+    async def _send_hook_error(self, request_id: Any, message: str) -> None:
+        try:
+            await self._runtime.send_error(request_id, kas_wire.HOOK_EXECUTE_REFUSED_CODE, message)
+        except Exception:
+            logger.warning("KAS executeHook refusal undeliverable for %s", self._session_id)
 
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build an AcpEvent for a permission request via the shared parser.

@@ -287,12 +287,16 @@ PROVIDER_LABEL_BY_BACKEND: dict = {
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under
 # _meta.kiro. The ones there are CALLBACK capabilities — KAS calls back into the
-# client to service them — and Kiro Crew implements none, so leaving them
-# undeclared (= false) is correct rather than a gap. Only the settings channel
-# is opened, because that is how a client selects KAS feature flags.
+# client to service them. Two are opened: the settings channel, which is how a
+# client selects KAS feature flags, and hooks, which Kiro Crew serves over
+# ``_kiro/hooks/*`` from its own store (``acp/kas_wire.py``) so a hook's command
+# is spawned by Kiro Crew behind its own gates. ``hooks`` carries the covenant's
+# shape and no ``v2`` sub-flag: ``v2`` selects the backend's own disk loader,
+# which spawns the command itself. Every other callback stays undeclared (=
+# false), which is correct rather than a gap.
 KAS_CLIENT_CAPABILITIES: dict = {
     **ACP_CLIENT_CAPABILITIES,
-    "_meta": {"kiro": {"settings": {}}},
+    "_meta": {"kiro": {"settings": {}, "hooks": {"enabled": True}}},
 }
 
 # ── Claude backend permission modes ──
