@@ -44,6 +44,61 @@ function PlainFallbackHeader({ children }: { children: ReactNode }) {
   )
 }
 
+/**
+ * The header row of the simplified file-pair fallback: the caller's prefix
+ * slot (the card's expand/collapse control), the filename, the caller's
+ * filename suffix, an optional state label, and the caller's metadata.
+ *
+ * Exported because the opted-in oversized pair keeps THIS row as its header
+ * once the line-by-line diff replaces the two-side body. Pierre's own header
+ * exists only while its renderer has a highlight result to draw — none while
+ * the worker pool is still initialising, recovering, or unavailable, none for
+ * a patch that will not parse, none at all in plain-diff mode — so a control
+ * slotted into it would vanish in every one of those states. One row, the same
+ * component before and after the swap; only the body beneath it changes.
+ */
+export function PlainFilePairHeader({ filename, titleId, label, titleClickable, stats, renderHeaderPrefix, renderHeaderFilenameSuffix, renderHeaderMetadata }: {
+  filename: string
+  titleId?: string
+  label?: string
+  /** The caller opens the file when the filename is clicked (a light-DOM
+   *  listener resolving `headerClickAction`), so the filename shows the pointer
+   *  and hover accent. Pierre's own header gets the same cue through the
+   *  caller's `unsafeCSS`, which is scoped to Pierre's shadow root and cannot
+   *  reach this row. */
+  titleClickable?: boolean
+  /** Exact added/removed line counts, rightmost like Pierre's own — only the
+   *  opted-in state has them (from its computed patch); the fallback's bounded
+   *  scan cannot count lines and passes none. */
+  stats?: { added: number; removed: number }
+  renderHeaderPrefix?: () => ReactNode
+  renderHeaderFilenameSuffix?: () => ReactNode
+  renderHeaderMetadata?: () => ReactNode
+}) {
+  return (
+    <div
+      data-diffs-header
+      className="flex min-h-9 items-center gap-2 border-b border-border bg-bg px-3 text-[12px]"
+    >
+      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+        {renderHeaderPrefix?.()}
+        <span id={titleId} data-title className={`truncate font-mono font-medium${titleClickable ? ' cursor-pointer hover:text-accent' : ''}`}>
+          {filename}
+        </span>
+        {renderHeaderFilenameSuffix?.()}
+        {label != null && <span className="text-[11px] font-normal text-muted">{label}</span>}
+      </div>
+      {renderHeaderMetadata && <div className="shrink-0">{renderHeaderMetadata()}</div>}
+      {stats && (
+        <span className="flex shrink-0 items-center gap-1 font-mono">
+          {stats.removed > 0 && <span data-deletions-count="" className="text-danger">-{stats.removed}</span>}
+          {stats.added > 0 && <span data-additions-count="" className="text-ok">+{stats.added}</span>}
+        </span>
+      )}
+    </div>
+  )
+}
+
 const KEYBOARD_SCROLL_REGION_PROPS = { role: 'region' as const, tabIndex: 0 }
 
 interface PlainFilePairFallbackProps {
@@ -57,6 +112,8 @@ interface PlainFilePairFallbackProps {
   renderHeaderMetadata?: () => ReactNode
   renderHeaderPrefix?: () => ReactNode
   renderHeaderFilenameSuffix?: () => ReactNode
+  /** See `PlainFilePairHeader`. */
+  titleClickable?: boolean
   onShowLineByLineDiff?: () => void
   /** Off-thread compute status for the opt-in. `computing` swaps the button
    *  for a progress label + Cancel; `error` re-offers the button with a short
@@ -81,6 +138,7 @@ export function PlainFilePairFallback({
   renderHeaderMetadata,
   renderHeaderPrefix,
   renderHeaderFilenameSuffix,
+  titleClickable,
   onShowLineByLineDiff,
   lineByLineState = 'idle',
   onCancelLineByLineDiff,
@@ -184,20 +242,15 @@ export function PlainFilePairFallback({
       className={`pierre-surface min-w-0 overflow-hidden bg-bg text-text ${className ?? ''}`}
     >
       {showHeader && (
-        <div
-          data-diffs-header
-          className="flex min-h-9 items-center gap-2 border-b border-border bg-bg px-3 text-[12px]"
-        >
-          <div className="flex min-w-0 flex-1 items-center gap-1.5">
-            {renderHeaderPrefix?.()}
-            <span id={titleId} data-title className="truncate font-mono font-medium">
-              {filename}
-            </span>
-            {renderHeaderFilenameSuffix?.()}
-            <span className="text-[11px] font-normal text-muted">{filePairLabel}</span>
-          </div>
-          {renderHeaderMetadata && <div className="shrink-0">{renderHeaderMetadata()}</div>}
-        </div>
+        <PlainFilePairHeader
+          filename={filename}
+          titleId={titleId}
+          label={filePairLabel}
+          titleClickable={titleClickable}
+          renderHeaderPrefix={renderHeaderPrefix}
+          renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
+          renderHeaderMetadata={renderHeaderMetadata}
+        />
       )}
       {/* Opt-in control lives in its own strip BETWEEN the header and the
           scroller, never inside either: the header already carries the

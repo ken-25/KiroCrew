@@ -96,7 +96,22 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: main @ 958e43fcc9 alone builds the chunk at
+  // 13,181,750 B (12872.8 KB) against the 12870 KB ceiling -- 2.8 KB OVER, so
+  // the gate fails on the merge ref of every open PR, the same drift a fourth
+  // time. Attribution is measured, not assumed: the diff-card collapse-control
+  // branch that surfaced it (#13565) touches `website/src/pierre/`,
+  // `website/src/components/`, one test and one capture script, and NOTHING
+  // under `website/src/i18n/`; its parent commit on main (0591500686) alone
+  // emits `all-A1Th9TUM.js` at 13,180,578 B and the branch on top of it emits
+  // the SAME file, byte for byte and content hash, so that branch owns 0 B of
+  // this chunk. The report still counts 14 modules (13 catalogs plus the entry)
+  // and no library reached it, so no lazy `import()` boundary or codeSplitting
+  // group can take the growth back out. Back to the 5% convention over main's
+  // tip. The value below is the one #13106 sets the same day over ITS
+  // measurement (12876.7 KB, which includes that branch's own 14.4 KB of
+  // catalog copy), so the two entries agree at merge instead of fighting.
+  all: 13520 * KB, // measured 12872.8 KB on main @ 958e43fcc9 2026-09-24 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
