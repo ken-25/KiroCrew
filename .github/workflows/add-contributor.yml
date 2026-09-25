@@ -1,7 +1,8 @@
 name: Add Contributor
 
-# Add the authors of merged pull requests, and the people who reported the issues
-# those pull requests closed, to the README Contributors block.
+# Add the authors of merged pull requests, the linked authors and co-authors of
+# those pull requests' commits, and the people who reported the issues those pull
+# requests closed, to the README Contributors block.
 # main is a protected branch, so this never commits directly -- it stages the
 # README edit on a single rolling feature branch, opens (or updates) one PR, and
 # arms GitHub auto-merge on it, like test-durations.yml. Auto-merge lets the
@@ -93,11 +94,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          # One paginated GraphQL sweep over EVERY merged pull request yields both
-          # sets of people this job credits:
+          # One paginated GraphQL sweep over EVERY merged pull request yields
+          # every set of people this job credits:
           #
-          #   1. the PR's own author, and
-          #   2. the authors of the issues that PR declared it closes.
+          #   1. the PR's own author,
+          #   2. the linked authors and co-authors of the PR's own commits, and
+          #   3. the authors of the issues that PR declared it closes.
+          #
+          # Crediting COMMIT authors and co-authors is what closes the
+          # superseded-PR attribution gap: when a maintainer lands someone's
+          # work as a replacement PR (their commits cherry-picked, or preserved
+          # via a `Co-authored-by:` trailer), the replacement PR's own author is
+          # the maintainer, and only the commit-author path names the original
+          # contributor. GitHub's `commits.authors` connection already resolves
+          # `Co-authored-by` trailers to linked accounts, so both the real
+          # committer and any co-author appear here as `user` nodes when their
+          # commit email is linked to a GitHub account. An UNLINKED email yields
+          # a null `user` and is skipped -- we never guess a login from an email
+          # (the manual --login path exists for that).
           #
           # Crediting issue REPORTERS this way, rather than by listing every
           # issue, is the whole point of the shape: `closingIssuesReferences` is
@@ -123,9 +137,19 @@ jobs:
           # (dependabot, renovate, github-actions, ...), whose author type is
           # "Bot" -- the GraphQL analogue of REST's `.user.type == "User"`.
           #
-          # `first: 50` on the nested connection is a cap, not a page: a single PR
-          # closing more than 50 issues would truncate. None come close, and the
-          # miss would be a missing credit, never a wrong one.
+          # `first: 50` on the closing-issues connection is a cap, not a page: a
+          # single PR closing more than 50 issues would truncate. None come
+          # close, and the miss would be a missing credit, never a wrong one.
+          #
+          # `commits(first: 100)` is likewise a cap, not paginated: GraphQL query
+          # cost scales with the product of the outer PR page (100) and every
+          # nested connection, so paginating commits per PR across --paginate
+          # would balloon the cost budget for no real gain. A PR with more than
+          # 100 commits is rare here, and any author past the cap simply falls to
+          # the manual --login path -- a missing credit, never a wrong one. The
+          # inner `authors(first: 10)` covers a commit's author plus its
+          # `Co-authored-by:` trailers; more than ten co-authors on one commit is
+          # not something this repo produces.
           gh api graphql --paginate \
             -f owner="${REPO%/*}" -f name="${REPO#*/}" \
             -f query='
@@ -136,6 +160,15 @@ jobs:
                     pageInfo { hasNextPage endCursor }
                     nodes {
                       author { login __typename }
+                      commits(first: 100) {
+                        nodes {
+                          commit {
+                            authors(first: 10) {
+                              nodes { user { login __typename } }
+                            }
+                          }
+                        }
+                      }
                       closingIssuesReferences(first: 50) {
                         nodes { author { login __typename } }
                       }
@@ -148,19 +181,31 @@ jobs:
           jq -r 'select(.author != null and .author.__typename == "User")
                  | .author.login' /tmp/merged.jsonl | sort -u >/tmp/pr_logins.txt
 
+          # Commit authors and co-authors of each merged PR. GitHub's
+          # `commits.authors` resolves `Co-authored-by:` trailers to linked
+          # accounts, so this one path credits both the committer and any
+          # co-author whose commit email is linked. A null `user` is an unlinked
+          # email and is skipped; `__typename == "User"` excludes bots, matching
+          # the PR-author and issue-reporter filters.
+          jq -r '.commits.nodes[]?.commit.authors.nodes[]?
+                 | select(.user != null and .user.__typename == "User")
+                 | .user.login' /tmp/merged.jsonl | sort -u >/tmp/commit_logins.txt
+
           jq -r '.closingIssuesReferences.nodes[]?
                  | select(.author != null and .author.__typename == "User")
                  | .author.login' /tmp/merged.jsonl | sort -u >/tmp/issue_logins.txt
 
-          # Union, deduped: someone who both authored a merged PR and reported a
-          # fixed issue appears in both files and must be credited exactly once.
-          # `sort -u` across both is the first of two dedup layers; the second is
-          # the script's own README scan, which is what keeps a daily full rebuild
-          # from ever duplicating an existing entry.
-          sort -u /tmp/pr_logins.txt /tmp/issue_logins.txt >/tmp/logins.txt
+          # Union, deduped: someone who authored a merged PR, committed to one,
+          # or reported a fixed issue can appear in more than one file and must
+          # be credited exactly once. `sort -u` across all three is the first of
+          # two dedup layers; the second is the script's own README scan, which
+          # is what keeps a daily full rebuild from ever duplicating an existing
+          # entry.
+          sort -u /tmp/pr_logins.txt /tmp/commit_logins.txt /tmp/issue_logins.txt >/tmp/logins.txt
 
           echo "Merged PRs scanned: $(wc -l </tmp/merged.jsonl)."
           echo "PR authors: $(wc -l </tmp/pr_logins.txt);" \
+               "commit authors/co-authors: $(wc -l </tmp/commit_logins.txt);" \
                "reporters of closed issues: $(wc -l </tmp/issue_logins.txt);" \
                "union: $(wc -l </tmp/logins.txt)."
 
